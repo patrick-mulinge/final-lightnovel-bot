@@ -1,4 +1,4 @@
-﻿import telebot
+import telebot
 import subprocess
 import os
 import shutil
@@ -43,6 +43,9 @@ UPLOAD_RETRY_SECOND_DELAY_MINUTES = 20
 PENDING_UPLOAD_DIR = "./pending_epub_uploads"
 PROGRESS_UPDATE_INTERVAL = 7  # seconds
 PREVIEW_RETRY_SERVER = "s4"
+USER_RETRY_WINDOW_HOURS = 20
+USER_RETRY_SLOT_LIMIT = 3
+
 
 # Seeded only once; admins update this catalog with /addsource and /delsource.
 DEFAULT_SOURCE_DIRECTORY = [
@@ -70,7 +73,7 @@ RUN_ID = str(uuid.uuid4())  # unique per process instance, changes on every rest
 class _NeverReject(dict):
     """Drop-in replacement for lncrawl's ctx.sources.rejected. Silently
     discards anything written to it, so a host that fails once is never
-    permanently cached as rejected â€” every future attempt (whether a
+    permanently cached as rejected — every future attempt (whether a
     later chapter in the same task, or a retry from s4/process_preview_loop)
     gets a genuine fresh network attempt instead of an instant cached failure."""
     def __setitem__(self, key, value):
@@ -143,6 +146,24 @@ def setup_trial_table():
                 "ALTER TABLE trial "
                 "ADD COLUMN IF NOT EXISTS retry_mode TEXT NOT NULL DEFAULT 'fast';"
             )
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS is_user_retry BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_server_id TEXT;")
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_expires_at TIMESTAMP;")
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS missing_chapters INT NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_attempts INT NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS cache_novel_id TEXT;")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_retry_slots (
+                    user_id BIGINT NOT NULL,
+                    task_id INT NOT NULL REFERENCES trial(id) ON DELETE CASCADE,
+                    first_retry_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, task_id)
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS user_retry_slots_window_idx
+                ON user_retry_slots (user_id, first_retry_at);
+            """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS trial_pending_picker_idx
                 ON trial (crawler_version, id)
@@ -384,7 +405,7 @@ else:
 class BotExceptionHandler(telebot.ExceptionHandler):
     def handle(self, exception):
         print(f"[HANDLER EXCEPTION] {exception}")
-        return True  # tells telebot the exception was handled â€” worker thread survives
+        return True  # tells telebot the exception was handled — worker thread survives
 
 bot = telebot.TeleBot(TOKEN, num_threads=20, exception_handler=BotExceptionHandler())
 
@@ -393,6 +414,7 @@ running_lock = threading.Lock()  # <--- add this right here
 pending_prompts = {}  # user_id -> pending bot message
 last_bot_messages = {}  # user_id -> list of final messages
 pending_urls = {}
+pending_retry_urls = {}  # user_id -> chat_id; the next message must be the completed task URL
 pending_cancel_trial = {}  # user_id -> ordered list of cancelable trial, expires after 10 minutes
 
 pending_range_state = {}  # user_id -> {token, chat_id, url, version, title, total_chapters, user_id, username, first_name, last_name}
@@ -704,11 +726,11 @@ def ask_v4_range(chat_id, user_id):
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
         telebot.types.InlineKeyboardButton(
-            "ðŸ“š All chapters",
+            "📚 All chapters",
             callback_data="range_all",
         ),
         telebot.types.InlineKeyboardButton(
-            "â†”ï¸ Custom range",
+            "↔️ Custom range",
             callback_data="range_custom",
         ),
     )
@@ -716,8 +738,8 @@ def ask_v4_range(chat_id, user_id):
     sent = bot.send_message(
         chat_id,
         "Select chapter range:\n\n"
-        "ðŸ“š All chapters â†’ download the full novel\n"
-        "â†”ï¸ Custom range â†’ choose a start and end chapter\n\n"
+        "📚 All chapters → download the full novel\n"
+        "↔️ Custom range → choose a start and end chapter\n\n"
         "Example custom range: 40-60 or 40 60",
         reply_markup=markup,
     )
@@ -783,6 +805,7 @@ def _crawl_v4_with_progress_impl(
     cancel_event,
     on_image_progress=None,
     on_total_known=None,
+    resume_missing=False,
 ):
     """Download the selected v4 chapters once, then fetch images and create the EPUB."""
     
@@ -809,6 +832,10 @@ def _crawl_v4_with_progress_impl(
     chapters = list(dict.fromkeys(_resolve_chapter_ids_v4(novel, chapter_range)))
     if not chapters:
         raise Exception("No chapters to download")
+
+    if resume_missing:
+        reopened = ctx.chapters.reopen_empty(chapters)
+        print(f"[RETRY] Reopened {reopened} stored-empty chapter(s) for {novel.title}")
 
     total = len(chapters)
     successful_chapter_ids = set()
@@ -849,7 +876,7 @@ def _crawl_v4_with_progress_impl(
                 if cancel_event.is_set():
                     raise Exception("Cancelled")
 
-                if chapter:
+                if chapter and chapter.is_available:
                     chapter_id = chapter.id
 
                     if chapter_id not in successful_chapter_ids:
@@ -888,6 +915,11 @@ def _crawl_v4_with_progress_impl(
         return retryable_failures
 
     failed_chapter_ids = download_chapter_batch(chapters, serial=False)
+    unavailable_chapter_ids = [
+        chapter_id for chapter_id in chapters
+        if not ctx.chapters.get(chapter_id).is_available
+    ]
+    failed_chapter_ids = list(dict.fromkeys(failed_chapter_ids + unavailable_chapter_ids))
 
     if failed_chapter_ids:
         print(
@@ -947,6 +979,8 @@ def _crawl_v4_with_progress_impl(
         novel.title,
         novel.synopsis or "",
         cover_source,
+        len(set(failed_chapter_ids)),
+        str(novel.id),
     )
 
 # ---------------------- NEW: V3 LIBRARY INTEGRATION ----------------------
@@ -966,6 +1000,7 @@ def crawl_v4_with_progress(
     cancel_event,
     on_image_progress=None,
     on_total_known=None,
+    resume_missing=False,
 ):
     """Run v4 while restoring its global image setting after this task."""
     ctx, _ = _v4()
@@ -978,6 +1013,7 @@ def crawl_v4_with_progress(
             cancel_event,
             on_image_progress=on_image_progress,
             on_total_known=on_total_known,
+            resume_missing=resume_missing,
         )
     finally:
         ctx.config.crawler.ignore_images = previous_ignore_images
@@ -1166,7 +1202,7 @@ def _range_timeout_watcher(user_id, token, delay):
 
     send_task_message(
         state["chat_id"],
-        f"â° No response for 10 minutes â€” automatically queuing the full novel (All chapters).",
+        f"⏰ No response for 10 minutes — automatically queuing the full novel (All chapters).",
         user_id
     )
     insert_task_direct(
@@ -1225,7 +1261,7 @@ def _abandon_preview(pid):
 def format_range_desc(chapter_range, total_chapters):
     cr = chapter_range.strip().lower()
     if not total_chapters:
-        return chapter_range  # unknown total (skipped/failed scan) â€” show raw input as-is
+        return chapter_range  # unknown total (skipped/failed scan) — show raw input as-is
     if cr == "all":
         return f"1 to {total_chapters}"
     if cr.startswith("first"):
@@ -1428,7 +1464,7 @@ def block_group_commands(message):
     try:
         warn = bot.send_message(
             message.from_user.id,
-            "âš ï¸ This bot cannot be used in that group.\nPlease send the command here to use it."
+            "⚠️ This bot cannot be used in that group.\nPlease send the command here to use it."
         )
         threading.Thread(
             target=delete_message_later,
@@ -1517,9 +1553,9 @@ def send_cover_post(chat_id, cover_source, display_title, source_url, crawler_ve
     safe_version = html.escape(str(crawler_version))
 
     caption = (
-        f"ðŸ“– <b>Novel:</b> {safe_title}\n"
-        f'ðŸŒ <b>Source:</b> <a href="{safe_url}">{safe_url}</a>\n'
-        f"ðŸ¤– <b>Crawler:</b> {safe_version}"
+        f"📖 <b>Novel:</b> {safe_title}\n"
+        f'🌐 <b>Source:</b> <a href="{safe_url}">{safe_url}</a>\n'
+        f"🤖 <b>Crawler:</b> {safe_version}"
     )
 
     if cover_source:
@@ -1768,18 +1804,18 @@ def upload_to_buzzheavier(file_path):
 
 def send_fallback_links(task_id, chat_id, title, gofile_url, buzzheavier_url):
     lines = [
-        "ðŸ“¥ <b>Telegram EPUB delivery is delayed.</b>",
-        f"ðŸ“– <b>{html.escape(title)}</b>",
+        "📥 <b>Telegram EPUB delivery is delayed.</b>",
+        f"📖 <b>{html.escape(title)}</b>",
         "",
         "You can download the EPUB now from:",
     ]
 
     if gofile_url:
-        lines.append(f'â€¢ <a href="{html.escape(gofile_url, quote=True)}">Gofile</a>')
+        lines.append(f'• <a href="{html.escape(gofile_url, quote=True)}">Gofile</a>')
 
     if buzzheavier_url:
         lines.append(
-            f'â€¢ <a href="{html.escape(buzzheavier_url, quote=True)}">Buzzheavier</a>'
+            f'• <a href="{html.escape(buzzheavier_url, quote=True)}">Buzzheavier</a>'
         )
 
     link_message = "\n".join(lines)
@@ -1879,9 +1915,10 @@ if SERVER_ID == "s4":
     def start(message):
         send_long_temp_message(
             message.chat.id,
-            "ðŸ‘‹ Welcome! I can help you download novels.\n"
+            "👋 Welcome! I can help you download novels.\n"
             "Use /download to start a download.\n"
             "Use /cancel to stop all your ongoing or queued downloads.\n"
+            "Use /retry after an EPUB reports missing chapters (available for 20 hours).\n"
             "Use /queue to view pending downloads and see if the bot is busy.\n"
             "Use /trial to check bot downloads for the past 24 hours.\n"
             "Use /sources to see supported websites.\n"
@@ -1893,7 +1930,7 @@ if SERVER_ID == "s4":
     def webtoepub(message):
         send_long_temp_message(
             message.chat.id,
-            "ðŸ“š WebToEpub lets you download novels as EPUB.\n\n"
+            "📚 WebToEpub lets you download novels as EPUB.\n\n"
             "Installation tutorial: https://t.me/LightnovelCrawlerTutorial/88\n"
             "How to use WebToEpub: https://t.me/LightnovelCrawlerTutorial/69\n"
             "How to update WebToEpub: https://t.me/LightnovelCrawlerTutorial/91\n"
@@ -1939,7 +1976,7 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=["banuser", "unbanuser", "userlimit"])
     def manage_user_control(message):
         if message.from_user.id not in ADMIN_USER_ID:
-            safe_send_message(message.chat.id, "âŒ Access Denied.")
+            safe_send_message(message.chat.id, "❌ Access Denied.")
             return
 
         parts = message.text.split()
@@ -1958,7 +1995,7 @@ if SERVER_ID == "s4":
         target_id, target_result = resolve_control_target(parts[1])
 
         if target_id is None:
-            safe_send_message(message.chat.id, f"âŒ {target_result}")
+            safe_send_message(message.chat.id, f"❌ {target_result}")
             return
 
         if command == "/userlimit":
@@ -1978,13 +2015,13 @@ if SERVER_ID == "s4":
             else:
                 safe_send_message(
                     message.chat.id,
-                    "âŒ The limit must be a whole number of 1 or more, or `off`.",
+                    "❌ The limit must be a whole number of 1 or more, or `off`.",
                 )
                 return
 
             conn = get_db_connection()
             if not conn:
-                safe_send_message(message.chat.id, "âŒ Database error.")
+                safe_send_message(message.chat.id, "❌ Database error.")
                 return
 
             try:
@@ -2007,7 +2044,7 @@ if SERVER_ID == "s4":
             status = "removed" if daily_limit is None else f"set to {daily_limit}"
             safe_send_message(
                 message.chat.id,
-                f"âœ… Daily limit for `{target_id}` {status}.",
+                f"✅ Daily limit for `{target_id}` {status}.",
                 parse_mode="Markdown",
             )
             return
@@ -2016,7 +2053,7 @@ if SERVER_ID == "s4":
 
         conn = get_db_connection()
         if not conn:
-            safe_send_message(message.chat.id, "âŒ Database error.")
+            safe_send_message(message.chat.id, "❌ Database error.")
             return
 
         try:
@@ -2042,7 +2079,7 @@ if SERVER_ID == "s4":
             conn.close()
 
         action = "banned" if is_banned else "unbanned"
-        safe_send_message(message.chat.id, f"âœ… User `{target_id}` was {action}.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"✅ User `{target_id}` was {action}.", parse_mode="Markdown")
     def _require_site_admin(message):
         if message.from_user.id in ADMIN_USER_ID:
             return True
@@ -2229,12 +2266,12 @@ if SERVER_ID == "s4":
     def cancel_selected_trial(user_id, chat_id, task_ids):
         """Cancel only task IDs that still belong to this user and are pending/running."""
         if not task_ids:
-            send_temp_message(chat_id, "â„¹ï¸ No trial were selected.", user_id)
+            send_temp_message(chat_id, "ℹ️ No trial were selected.", user_id)
             return
 
         conn = get_db_connection()
         if not conn:
-            send_temp_message(chat_id, "âš ï¸ Database error. Try again.", user_id)
+            send_temp_message(chat_id, "⚠️ Database error. Try again.", user_id)
             return
 
         try:
@@ -2254,7 +2291,7 @@ if SERVER_ID == "s4":
             if not cancelled_trial:
                 send_temp_message(
                     chat_id,
-                    "â„¹ï¸ None of those trial were still pending or running.",
+                    "ℹ️ None of those trial were still pending or running.",
                     user_id,
                 )
                 return
@@ -2272,12 +2309,12 @@ if SERVER_ID == "s4":
             cancelled_ids = ", ".join(str(task["id"]) for task in cancelled_trial)
             send_temp_message(
                 chat_id,
-                f"âŒ Cancelled task(s): {cancelled_ids}",
+                f"❌ Cancelled task(s): {cancelled_ids}",
                 user_id,
             )
 
         except Exception as e:
-            send_temp_message(chat_id, f"âŒ Cancel failed: {e}", user_id)
+            send_temp_message(chat_id, f"❌ Cancel failed: {e}", user_id)
         finally:
             conn.close()
 
@@ -2299,7 +2336,7 @@ if SERVER_ID == "s4":
         if not trial:
             send_temp_message(
                 chat_id,
-                "âŒ› Your cancellation list expired. Send /cancel again.",
+                "⌛ Your cancellation list expired. Send /cancel again.",
                 user_id,
             )
             return
@@ -2314,7 +2351,7 @@ if SERVER_ID == "s4":
         if not raw_tokens:
             send_temp_message(
                 chat_id,
-                "âŒ Enter one or more list numbers or task IDs.",
+                "❌ Enter one or more list numbers or task IDs.",
                 user_id,
             )
             return
@@ -2343,7 +2380,7 @@ if SERVER_ID == "s4":
             ignored_text = ", ".join(ignored_inputs) or "your input"
             send_temp_message(
                 chat_id,
-                f"âŒ No matching trial found. Ignored: {ignored_text}\n\n"
+                f"❌ No matching trial found. Ignored: {ignored_text}\n\n"
                 "Send /cancel and select trial again.",
                 user_id,
             )
@@ -2355,7 +2392,7 @@ if SERVER_ID == "s4":
         if ignored_inputs:
             send_temp_message(
                 chat_id,
-                f"â„¹ï¸ Ignored invalid/non-matching entries: {', '.join(ignored_inputs)}",
+                f"ℹ️ Ignored invalid/non-matching entries: {', '.join(ignored_inputs)}",
                 user_id,
             )
 
@@ -2380,7 +2417,7 @@ if SERVER_ID == "s4":
             conn = get_db_connection()
             if not conn:
                 bot.answer_callback_query(call.id, "Database error.")
-                send_temp_message(chat_id, "âš ï¸ Database error. Try again.", user_id)
+                send_temp_message(chat_id, "⚠️ Database error. Try again.", user_id)
                 return
 
             try:
@@ -2407,7 +2444,7 @@ if SERVER_ID == "s4":
         conn = get_db_connection()
         if not conn:
             bot.answer_callback_query(call.id, "Database error.")
-            send_temp_message(chat_id, "âš ï¸ Database error. Try again.", user_id)
+            send_temp_message(chat_id, "⚠️ Database error. Try again.", user_id)
             return
 
         try:
@@ -2433,14 +2470,14 @@ if SERVER_ID == "s4":
 
         if not trial:
             bot.answer_callback_query(call.id, "No trial to cancel.")
-            send_temp_message(chat_id, "â„¹ï¸ No pending or running downloads to cancel.", user_id)
+            send_temp_message(chat_id, "ℹ️ No pending or running downloads to cancel.", user_id)
             return
 
         # Save only this user's task list; later input cannot cancel anyone else's task.
         pending_cancel_trial[user_id] = trial
         cancel_selection_timeout(user_id)
 
-        text = "ðŸ“‹ Your pending/running downloads:\n\n"
+        text = "📋 Your pending/running downloads:\n\n"
         for number, task in enumerate(trial, start=1):
             server = task["server_id"] or "Not assigned"
             completed = task["completed_at"] or "Not completed"
@@ -2486,7 +2523,7 @@ if SERVER_ID == "s4":
 
         conn = get_db_connection()
         if not conn:
-            send_temp_message(chat_id, "âš ï¸ Database error. Try again.", user_id)
+            send_temp_message(chat_id, "⚠️ Database error. Try again.", user_id)
             return
 
         try:
@@ -2504,7 +2541,7 @@ if SERVER_ID == "s4":
         if task_count == 0:
             send_temp_message(
                 chat_id,
-                "â„¹ï¸ You have no pending or running downloads to cancel.",
+                "ℹ️ You have no pending or running downloads to cancel.",
                 user_id,
             )
             return
@@ -2512,11 +2549,11 @@ if SERVER_ID == "s4":
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(
             telebot.types.InlineKeyboardButton(
-                "âŒ Cancel all",
+                "❌ Cancel all",
                 callback_data="cancel_all",
             ),
             telebot.types.InlineKeyboardButton(
-                "ðŸ“‹ Select trial",
+                "📋 Select trial",
                 callback_data="cancel_select",
             ),
         )
@@ -2534,12 +2571,12 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['scan'])
     def scan_requests(message):
         if message.from_user.id not in ADMIN_USER_ID:
-            bot.send_message(message.chat.id, "âŒ Access Denied.")
+            bot.send_message(message.chat.id, "❌ Access Denied.")
             return
 
         conn = get_db_connection()
         if not conn:
-            send_temp_message(message.chat.id, "âš ï¸ Cannot connect to Database.", message.from_user.id)
+            send_temp_message(message.chat.id, "⚠️ Cannot connect to Database.", message.from_user.id)
             return
 
         try:
@@ -2553,29 +2590,29 @@ if SERVER_ID == "s4":
                 rows = cur.fetchall()
 
                 if not rows:
-                    send_temp_message(message.chat.id, "â„¹ï¸ No scan requests found.", message.from_user.id)
+                    send_temp_message(message.chat.id, "ℹ️ No scan requests found.", message.from_user.id)
                     return
 
-                text = "ðŸ” Scan Requests:\n\n"
+                text = "🔍 Scan Requests:\n\n"
                 for r in rows:
                     username = f"@{r['username']}" if r['username'] else "N/A"
                     first = r['first_name'] or "N/A"
                     last = r['last_name'] or "N/A"
 
                     text += (
-                        f"ðŸ†” ID: {r['id']}\n"
-                        f"ðŸ‘¤ User ID: {r['user_id']}\n"
-                        f"ðŸ”— Username: {username}\n"
-                        f"ðŸ“› Name: {first} {last}\n"
-                        f"ðŸ–¥ Server: {r['server_id']}\n"
-                        f"âš™ï¸ Version: {r['version']}\n"
-                        f"ðŸ“Œ Status: {r['status']}\n"
-                        f"ðŸŒ URL: {r['url']}\n"
-                        f"ðŸ“– Title: {r['title'] or 'N/A'}\n"
-                        f"ðŸ“š Volumes: {r['volume_count'] if r['volume_count'] is not None else 'N/A'} | "
+                        f"🆔 ID: {r['id']}\n"
+                        f"👤 User ID: {r['user_id']}\n"
+                        f"🔗 Username: {username}\n"
+                        f"📛 Name: {first} {last}\n"
+                        f"🖥 Server: {r['server_id']}\n"
+                        f"⚙️ Version: {r['version']}\n"
+                        f"📌 Status: {r['status']}\n"
+                        f"🌐 URL: {r['url']}\n"
+                        f"📖 Title: {r['title'] or 'N/A'}\n"
+                        f"📚 Volumes: {r['volume_count'] if r['volume_count'] is not None else 'N/A'} | "
                         f"Chapters: {r['chapter_count'] if r['chapter_count'] is not None else 'N/A'}\n"
-                        f"â— Error: {r['error'] or 'N/A'}\n"
-                        f"ðŸ•’ Created: {r['created_at']}\n"
+                        f"❗ Error: {r['error'] or 'N/A'}\n"
+                        f"🕒 Created: {r['created_at']}\n"
                         f"-----------------------------\n"
                     )
                 send_temp_long_message(message.chat.id, text, message.from_user.id)
@@ -2589,7 +2626,7 @@ if SERVER_ID == "s4":
         if not conn:
             send_temp_message(
                 message.chat.id,
-                "âš ï¸ Cannot connect to Database. If error persists, contact https://t.me/patiorjunrick004 with this message.",
+                "⚠️ Cannot connect to Database. If error persists, contact https://t.me/patiorjunrick004 with this message.",
                 message.from_user.id
             )
             return
@@ -2606,23 +2643,23 @@ if SERVER_ID == "s4":
                 if not trial:
                     send_temp_message(
                         message.chat.id,
-                        "â„¹ï¸ Queue is empty.",
+                        "ℹ️ Queue is empty.",
                         message.from_user.id
                     )
                     return
 
-                text = "ðŸ“‹ Pending trial Queue:\n\n"
+                text = "📋 Pending trial Queue:\n\n"
 
                 for t in trial:
                     text += (
-                        f"ðŸ†” Task ID: {t['id']}\n"
-                        f"ðŸ‘¤ User ID: {t['user_id']}\n"
-                        f"ðŸ–¥ Server: {t['server_id']}\n"
-                        f"âš™ï¸ Crawler: {t['crawler_version']}\n"
-                        f"ðŸŒ URL: {t['url']}\n"
-                        f"ðŸ“– Range: {t['chapter_range']}\n"
-                        f"ðŸ“Œ Status: {t['status']}\n"
-                        f"ðŸ•’ Created: {t['created_at']}\n"
+                        f"🆔 Task ID: {t['id']}\n"
+                        f"👤 User ID: {t['user_id']}\n"
+                        f"🖥 Server: {t['server_id']}\n"
+                        f"⚙️ Crawler: {t['crawler_version']}\n"
+                        f"🌐 URL: {t['url']}\n"
+                        f"📖 Range: {t['chapter_range']}\n"
+                        f"📌 Status: {t['status']}\n"
+                        f"🕒 Created: {t['created_at']}\n"
                         f"-----------------------------\n"
                     )
 
@@ -2643,7 +2680,7 @@ if SERVER_ID == "s4":
         if not conn:
             send_temp_message(
                 message.chat.id,
-                "âš ï¸ Cannot connect to Database, if error persists, contact https://t.me/patiorjunrick004 with this message.",
+                "⚠️ Cannot connect to Database, if error persists, contact https://t.me/patiorjunrick004 with this message.",
                 message.from_user.id
             )
             return
@@ -2659,24 +2696,24 @@ if SERVER_ID == "s4":
                 if not trial:
                     send_temp_message(
                         message.chat.id,
-                        "â„¹ï¸ Queue is empty.",
+                        "ℹ️ Queue is empty.",
                         message.from_user.id
                     )
                     return
 
-                text = "ðŸ“‹ All trial in Table:\n\n"
+                text = "📋 All trial in Table:\n\n"
 
                 for t in trial:
                     text += (
-                        f"ðŸ†” Task ID: {t['id']}\n"
-                        f"ðŸ‘¤ User ID: {t['user_id']}\n"
-                        f"ðŸ–¥ Server: {t['server_id']}\n"
-                        f"âš™ï¸ Crawler: {t['crawler_version']}\n"
-                        f"ðŸ“Œ Status: {t['status']}\n"
-                        f"ðŸŒ URL: {t['url']}\n"
-                        f"ðŸ“– Range: {t['chapter_range']}\n"
-                        f"ðŸ•’ Created: {t['created_at']}\n"
-                        f"âœ… Completed: {t['completed_at']}\n"
+                        f"🆔 Task ID: {t['id']}\n"
+                        f"👤 User ID: {t['user_id']}\n"
+                        f"🖥 Server: {t['server_id']}\n"
+                        f"⚙️ Crawler: {t['crawler_version']}\n"
+                        f"📌 Status: {t['status']}\n"
+                        f"🌐 URL: {t['url']}\n"
+                        f"📖 Range: {t['chapter_range']}\n"
+                        f"🕒 Created: {t['created_at']}\n"
+                        f"✅ Completed: {t['completed_at']}\n"
                         f"------------------------------\n"
                     )
 
@@ -2689,6 +2726,95 @@ if SERVER_ID == "s4":
         finally:
             conn.close()
 
+    @bot.message_handler(commands=['retry'])
+    def retry_download(message):
+        pending_retry_urls[message.from_user.id] = message.chat.id
+        send_prompt(
+            message.chat.id,
+            "Send the same novel link within 20 hours to retry its missing chapters.\n"
+            "Retries work only for completed v4 EPUBs that had missing chapters.",
+            message.from_user.id,
+        )
+        bot.register_next_step_handler_by_chat_id(message.chat.id, receive_retry_url)
+
+    def receive_retry_url(message):
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        if pending_retry_urls.pop(user_id, None) != chat_id:
+            return
+
+        retry_url = message.text.strip()
+        conn = get_db_connection()
+        if not conn:
+            send_temp_message(chat_id, "⚠️ Database error. Try again.", user_id)
+            return
+
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(%s);", (user_id,))
+                cur.execute("DELETE FROM user_retry_slots WHERE user_id=%s AND first_retry_at < NOW() - INTERVAL '24 hours';", (user_id,))
+                cur.execute("""
+                    SELECT *
+                    FROM trial
+                    WHERE user_id=%s
+                      AND crawler_version='v4'
+                      AND status='done'
+                      AND missing_chapters > 0
+                      AND retry_expires_at > NOW()
+                      AND rtrim(url, '/') = rtrim(%s, '/')
+                    ORDER BY completed_at DESC
+                    LIMIT 1
+                    FOR UPDATE;
+                """, (user_id, retry_url))
+                task = cur.fetchone()
+                if not task:
+                    conn.rollback()
+                    send_temp_message(
+                        chat_id,
+                        "❌ No completed v4 EPUB with missing chapters was found for that link, or its 20-hour retry window expired.",
+                        user_id,
+                    )
+                    return
+                if not task['server_id']:
+                    conn.rollback()
+                    send_temp_message(chat_id, "❌ The original worker is unknown, so this EPUB cannot be retried safely.", user_id)
+                    return
+
+                cur.execute("SELECT 1 FROM user_retry_slots WHERE user_id=%s AND task_id=%s;", (user_id, task['id']))
+                uses_existing_slot = cur.fetchone() is not None
+                if not uses_existing_slot:
+                    cur.execute("SELECT COUNT(*) AS count FROM user_retry_slots WHERE user_id=%s;", (user_id,))
+                    if cur.fetchone()['count'] >= USER_RETRY_SLOT_LIMIT:
+                        conn.rollback()
+                        send_temp_message(
+                            chat_id,
+                            "❌ You can retry up to 3 different novels in each rolling 24-hour period. You can still retry a novel you already retried.",
+                            user_id,
+                        )
+                        return
+                    cur.execute("INSERT INTO user_retry_slots (user_id, task_id) VALUES (%s, %s);", (user_id, task['id']))
+
+                cur.execute("""
+                    UPDATE trial
+                    SET status='pending', completed_at=NULL, is_user_retry=TRUE,
+                        retry_server_id=%s, retry_attempts=retry_attempts + 1
+                    WHERE id=%s;
+                """, (task['server_id'], task['id']))
+                conn.commit()
+        except Exception as error:
+            conn.rollback()
+            print(f"[USER RETRY ERROR] {error}")
+            send_temp_message(chat_id, "❌ Could not queue the retry. Try again shortly.", user_id)
+            return
+        finally:
+            conn.close()
+
+        send_temp_message(
+            chat_id,
+            f"🔁 Retry queued for Task {task['id']}. It will run next on {task['server_id']} after that server finishes its current download.",
+            user_id,
+        )
+
     # ---------------------- DOWNLOAD COMMAND ----------------------
     @bot.message_handler(commands=['download'])
     def download(message):
@@ -2697,15 +2823,15 @@ if SERVER_ID == "s4":
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(
             telebot.types.InlineKeyboardButton(
-                "âš™ï¸ v3.10.1 (UnStable)", callback_data="version_v3"
+                "⚙️ v3.10.1 (UnStable)", callback_data="version_v3"
             ),
             telebot.types.InlineKeyboardButton(
-                "ðŸš€ v4.13.1 (Stable)", callback_data="version_v4"
+                "🚀 v4.13.1 (Stable)", callback_data="version_v4"
             )
         )
         markup.add(
             telebot.types.InlineKeyboardButton(
-                "â“ Description", callback_data="version_description"
+                "❓ Description", callback_data="version_description"
             )
         )
 
@@ -2715,17 +2841,17 @@ if SERVER_ID == "s4":
             reply_markup=markup
         )
 
-        # âœ… Track this prompt so it can be deleted later
+        # ✅ Track this prompt so it can be deleted later
         pending_prompts[user_id] = sent
 
         
     def get_version(message):
         version = message.text.strip()
         if version not in ("v3", "v4"):
-            send_temp_message(message.chat.id, "âŒ Invalid version.", message.from_user.id)
+            send_temp_message(message.chat.id, "❌ Invalid version.", message.from_user.id)
             return
 
-        send_prompt(message.chat.id, "ðŸ“Œ Enter novel URL:", message.from_user.id)
+        send_prompt(message.chat.id, "📌 Enter novel URL:", message.from_user.id)
         bot.register_next_step_handler(message, get_url, version)
 
 
@@ -2743,7 +2869,7 @@ if SERVER_ID == "s4":
     ):
         conn = get_db_connection()
         if not conn:
-            send_temp_message(chat_id, "âŒ Database error.", user_id)
+            send_temp_message(chat_id, "❌ Database error.", user_id)
             return False
         remaining_trial = None
         daily_task_limit = None
@@ -2763,7 +2889,7 @@ if SERVER_ID == "s4":
                     conn.rollback()
                     send_temp_message(
                         chat_id,
-                        "ðŸš« You cannot create download trial with this bot.",
+                        "🚫 You cannot create download trial with this bot.",
                         user_id,
                     )
                     return False
@@ -2783,7 +2909,7 @@ if SERVER_ID == "s4":
                         conn.rollback()
                         send_temp_message(
                             chat_id,
-                            f"ðŸš« You have reached your limit of "
+                            f"🚫 You have reached your limit of "
                             f"{control['daily_task_limit']} download task(s) "
                             f"within the last 24 hours.",
                             user_id,
@@ -2823,7 +2949,7 @@ if SERVER_ID == "s4":
         except Exception as error:
             conn.rollback()
             print(f"[TASK INSERT ERROR] {error}")
-            send_temp_message(chat_id, "âŒ Database error.", user_id)
+            send_temp_message(chat_id, "❌ Database error.", user_id)
             return False
         finally:
             conn.close()
@@ -2831,14 +2957,14 @@ if SERVER_ID == "s4":
         limit_note = ""
         if remaining_trial is not None:
             limit_note = (
-                f"\n\nðŸ“Š Daily task limit: "
+                f"\n\n📊 Daily task limit: "
                 f"{remaining_trial}/{daily_task_limit} task(s) remaining "
                 f"within the next 24 hours."
             )
 
         send_temp_message(
             chat_id,
-            "âœ… Download task has been queued and will be processed shortly."
+            "✅ Download task has been queued and will be processed shortly."
             f"{limit_note}\n\n"
             "Send /download to create a new task.",
             user_id,
@@ -2893,25 +3019,25 @@ if SERVER_ID == "s4":
             )
             return
 
-         # ðŸ” AUTO SWITCH v3 âžœ v4 for unsupported v3 sources
+         # 🔁 AUTO SWITCH v3 ➜ v4 for unsupported v3 sources
         if version == "v3" and is_v3_broken_source(url):
             send_temp_message(
                 chat_id,
-                "âš ï¸ This source does not work on v3.10.1\n\n"
-                "ðŸ” Automatically switching to v4.13.1 ",
+                "⚠️ This source does not work on v3.10.1\n\n"
+                "🔁 Automatically switching to v4.13.1 ",
                 user_id
             )
             version = "v4"
 
-        # ðŸš« BLOCK fanmtl & wuxiabox ON v4 ONLY
+        # 🚫 BLOCK fanmtl & wuxiabox ON v4 ONLY
         if version == "v4" and is_v4_banned_source(url):
             send_temp_message(
                 chat_id,
-                "âš ï¸ This source is unstable on v4.13.1\n\n"
-                "ðŸ” Automatically switching to v3.10.1",
+                "⚠️ This source is unstable on v4.13.1\n\n"
+                "🔁 Automatically switching to v3.10.1",
                 user_id
             )
-            version = "v3"  # ðŸ‘ˆ FORCE SWITCH
+            version = "v3"  # 👈 FORCE SWITCH
 
 
         pid = request_preview(
@@ -2921,17 +3047,17 @@ if SERVER_ID == "s4":
             last_name=message.from_user.last_name
         )
         if pid is None:
-            send_temp_message(chat_id, "âŒ Database error, please try again.", user_id)
+            send_temp_message(chat_id, "❌ Database error, please try again.", user_id)
             return
 
         scan_cancel_event = threading.Event()
         skip_scan_events[pid] = scan_cancel_event
 
         markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("â­ Skip scan â€” enter range now", callback_data=f"skipscan_{pid}"))
+        markup.add(telebot.types.InlineKeyboardButton("⏭ Skip scan — enter range now", callback_data=f"skipscan_{pid}"))
         scanning_msg = bot.send_message(
             chat_id,
-            "ðŸ” Scanning novel page...\n\nLarge novels can take a while â€” tap below to skip straight to entering the chapter range.",
+            "🔍 Scanning novel page...\n\nLarge novels can take a while — tap below to skip straight to entering the chapter range.",
             reply_markup=markup
         )
 
@@ -2947,7 +3073,7 @@ if SERVER_ID == "s4":
 
         if row == "skipped" or row is None or (isinstance(row, dict) and row.get('status') == 'abandoned'):
             try:
-                edit_and_autodelete(chat_id, scanning_msg.message_id, "â­ Skipping scan â€” enter the chapter range manually.")
+                edit_and_autodelete(chat_id, scanning_msg.message_id, "⏭ Skipping scan — enter the chapter range manually.")
             except Exception:
                 pass
             prompt_manual_range(message, chat_id, user_id, url, version)
@@ -2955,17 +3081,17 @@ if SERVER_ID == "s4":
 
         if row['status'] == 'failed':
             edit_and_autodelete(
-                chat_id, scanning_msg.message_id, f"âŒ Couldn't read that page ({row['error']}).\nCheck the link and try again with /download."
+                chat_id, scanning_msg.message_id, f"❌ Couldn't read that page ({row['error']}).\nCheck the link and try again with /download."
             )
             return
         if not row['chapter_count']:
-            edit_and_autodelete(chat_id, scanning_msg.message_id, "âŒ No chapters found on that page. Check if the link leads to the novel's info page."
+            edit_and_autodelete(chat_id, scanning_msg.message_id, "❌ No chapters found on that page. Check if the link leads to the novel's info page."
             )
             return
 
         edit_and_autodelete(
             chat_id, scanning_msg.message_id,
-            f"ðŸ“– {row['title']}\n{row['volume_count']} volumes, {row['chapter_count']} chapters found.",
+            f"📖 {row['title']}\n{row['volume_count']} volumes, {row['chapter_count']} chapters found.",
             delay=300  # auto-delete after 5 minutes
         )
 
@@ -2985,7 +3111,7 @@ if SERVER_ID == "s4":
         ev = skip_scan_events.pop(pid, None)
         if ev:
             ev.set()
-        # Also write the skip directly to the DB â€” this works even if the
+        # Also write the skip directly to the DB — this works even if the
         # background wait thread ends up running on a different process
         # than the one that receives this button click.
         _abandon_preview(pid)
@@ -3042,7 +3168,7 @@ if SERVER_ID == "s4":
         except (ValueError, TypeError):
             send_temp_message(
                 chat_id,
-                "âŒ Invalid range. Send it like: 40-60 or 40 60\n"
+                "❌ Invalid range. Send it like: 40-60 or 40 60\n"
                 "The first number must be at least 1 and cannot be above the last number.",
                 user_id,
             )
@@ -3077,22 +3203,22 @@ if SERVER_ID == "s4":
             # Send the temporary description message
             send_temp_long_message(
                 chat_id,
-                "<b>ðŸ“Œ Crawler Versions Description</b>\n\n"
-                " <b> â€¢ v3.10.1 </b>\n"
+                "<b>📌 Crawler Versions Description</b>\n\n"
+                " <b> • v3.10.1 </b>\n"
                 "– Old version released on Jun 16, 2025\n"
-                " âœ… Pros: \n"
+                " ✅ Pros: \n"
                 "--> It is faster.\n"
-                " âš ï¸ Cons: \n"
+                " ⚠️ Cons: \n"
                 "--> Some newer sites may not be supported.\n"
                 "--> Most of the novels it downloads will have missing chapters.\n"
                 
-                " <b> â€¢ v4.13.1 ––Recommended</b>\n"
+                " <b> • v4.13.1 ––Recommended</b>\n"
                 "– Newest version cloned from github on July 27, 2026\n"
 
-                " âœ… Pros: \n"
+                " ✅ Pros: \n"
                 "--> Supports newest sources/sites\n"
                 "--> Some issues were resolved\n"
-                " âš ï¸ Cons: \n"
+                " ⚠️ Cons: \n"
                 "--> May be slower\n"
                 "– The sources that v4.13.1 supports are here: https://github.com/dipu-bd/lightnovel-crawler but not all may work.\n"
                 "– To ask for more sources to be added, or to report broken sources, create an issue here: https://github.com/dipu-bd/lightnovel-crawler/issues/new/choose\n"
@@ -3105,8 +3231,8 @@ if SERVER_ID == "s4":
             # Re-show the version selection buttons after description
             markup = telebot.types.InlineKeyboardMarkup()
             markup.add(
-                telebot.types.InlineKeyboardButton("âš™ï¸ v3.10.1 (UnStable)", callback_data="version_v3"),
-                telebot.types.InlineKeyboardButton("ðŸš€ v4.13.1 (Stable)", callback_data="version_v4")
+                telebot.types.InlineKeyboardButton("⚙️ v3.10.1 (UnStable)", callback_data="version_v3"),
+                telebot.types.InlineKeyboardButton("🚀 v4.13.1 (Stable)", callback_data="version_v4")
             )
 
 
@@ -3119,7 +3245,7 @@ if SERVER_ID == "s4":
 
         # Existing version selection flow
         version = call.data.replace("version_", "")
-        send_prompt(chat_id, "ðŸ“Œ Enter novel URL:", user_id)
+        send_prompt(chat_id, "📌 Enter novel URL:", user_id)
         bot.register_next_step_handler_by_chat_id(chat_id, get_url, version)
         bot.answer_callback_query(call.id)
 
@@ -3132,7 +3258,7 @@ if SERVER_ID == "s4":
 
         pending = pending_urls.pop(user_id, None)
         if not pending:
-            bot.answer_callback_query(call.id, "âŒ Session expired")
+            bot.answer_callback_query(call.id, "❌ Session expired")
             return
 
         url = pending["url"]
@@ -3166,7 +3292,7 @@ if SERVER_ID == "s4":
 
         send_temp_message(
             chat_id,
-            "â†”ï¸ Send the chapter range you want.\n\n"
+            "↔️ Send the chapter range you want.\n\n"
             "Example: 40-60 or 40 60\n"
             "This downloads chapter 40 through chapter 60.",
             user_id,
@@ -3186,14 +3312,14 @@ if SERVER_ID == "s4":
     def logs(message):
         # Check if the user is an admin
         if message.from_user.id not in ADMIN_USER_ID:
-            bot.send_message(message.chat.id, "âŒ Access Denied.")
+            bot.send_message(message.chat.id, "❌ Access Denied.")
             return
         
         conn = get_db_connection()
         if not conn:
             send_temp_message(
                 message.chat.id,
-                "âš ï¸ Cannot connect to Database. If the error persists, contact support. https://t.me/patiorjunrick004",
+                "⚠️ Cannot connect to Database. If the error persists, contact support. https://t.me/patiorjunrick004",
                 message.from_user.id
             )
             return
@@ -3222,12 +3348,12 @@ if SERVER_ID == "s4":
                 if not trial:
                     send_temp_message(
                         message.chat.id,
-                        "â„¹ï¸ No task logs found.",
+                        "ℹ️ No task logs found.",
                         message.from_user.id
                     )
                     return
 
-                text = "ðŸ“œ Task Logs (with user details):\n\n"
+                text = "📜 Task Logs (with user details):\n\n"
 
                 for t in trial:
                     username = f"@{t['username']}" if t['username'] else "N/A"
@@ -3235,17 +3361,17 @@ if SERVER_ID == "s4":
                     last = t['last_name'] or "N/A"
 
                     text += (
-                        f"ðŸ†” Task ID: {t['id']}\n"
-                        f"ðŸ‘¤ User ID: {t['user_id']}\n"
-                        f"ðŸ”— Username: {username}\n"
-                        f"ðŸ“› Name: {first} {last}\n"
-                        f"ðŸ–¥ Server: {t['server_id']}\n"
-                        f"âš™ï¸ Crawler: {t['crawler_version']}\n"
-                        f"ðŸ“Œ Status: {t['status']}\n"
-                        f"ðŸŒ URL: {t['url']}\n"
-                        f"ðŸ“– Range: {t['chapter_range']}\n"
-                        f"ðŸ•’ Created: {t['created_at']}\n"
-                        f"âœ… Completed: {t['completed_at']}\n"
+                        f"🆔 Task ID: {t['id']}\n"
+                        f"👤 User ID: {t['user_id']}\n"
+                        f"🔗 Username: {username}\n"
+                        f"📛 Name: {first} {last}\n"
+                        f"🖥 Server: {t['server_id']}\n"
+                        f"⚙️ Crawler: {t['crawler_version']}\n"
+                        f"📌 Status: {t['status']}\n"
+                        f"🌐 URL: {t['url']}\n"
+                        f"📖 Range: {t['chapter_range']}\n"
+                        f"🕒 Created: {t['created_at']}\n"
+                        f"✅ Completed: {t['completed_at']}\n"
                         f"-----------------------------\n"
                     )
 
@@ -3264,7 +3390,7 @@ if SERVER_ID == "s4":
         global notified_dead_servers
         conn = get_db_connection()
         if not conn:
-            send_temp_message(message.chat.id, "âš ï¸ Cannot connect to DB", message.from_user.id)
+            send_temp_message(message.chat.id, "⚠️ Cannot connect to DB", message.from_user.id)
             return
 
         try:
@@ -3272,10 +3398,10 @@ if SERVER_ID == "s4":
                 cur.execute("SELECT server_id, last_heartbeat, status FROM servers ORDER BY server_id")
                 servers = cur.fetchall()
                 if not servers:
-                    send_temp_message(message.chat.id, "â„¹ï¸ No servers found.", message.from_user.id)
+                    send_temp_message(message.chat.id, "ℹ️ No servers found.", message.from_user.id)
                     return
                 
-                text = "ðŸ–¥ï¸ Servers status:\n"
+                text = "🖥️ Servers status:\n"
                 for s in servers:
                     last_seen = s['last_heartbeat']
                     if last_seen:
@@ -3295,19 +3421,29 @@ if SERVER_ID == "s4":
    
 
 # ---------------------- CRAWLING WORKER ----------------------
-def mark_failed(task_id):
+def mark_failed(task_id, keep_retryable=False):
     conn = get_db_connection()
     if conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE trial
-                    SET status='failed', completed_at=NOW()
-                    WHERE id=%s AND status!='cancelled'
-                    """,
-                    (task_id,)
-                )
+                if keep_retryable:
+                    cur.execute(
+                        """
+                        UPDATE trial
+                        SET status='done', completed_at=NOW(), is_user_retry=FALSE
+                        WHERE id=%s AND status!='cancelled'
+                        """,
+                        (task_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE trial
+                        SET status='failed', completed_at=NOW()
+                        WHERE id=%s AND status!='cancelled'
+                        """,
+                        (task_id,),
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -3344,12 +3480,13 @@ def process_trial_loop():
                 task = None
 
                 if SERVER_ID == "s4":
-                    # 1ï¸âƒ£ s4 tries to pick a failed task from other servers first
+                    # 1️⃣ s4 tries to pick a failed task from other servers first
                     cur.execute("""
                         SELECT *
                         FROM trial
                         WHERE status='failed'
                           AND crawler_version= %s
+                          AND NOT is_user_retry
                           AND (server_id IS NULL OR server_id != %s)
                         ORDER BY id ASC
                         LIMIT 1
@@ -3362,20 +3499,22 @@ def process_trial_loop():
                         # Notify user that s2 is retrying their task
                         send_task_message(
                             task['chat_id'],
-                            f"ðŸ” Retrying failed download...\n\n"
-                            f"ðŸ†” Task ID: {task['id']}\n"
-                            f"ðŸ”— URL: {task['url']}",
+                            f"🔁 Retrying failed download...\n\n"
+                            f"🆔 Task ID: {task['id']}\n"
+                            f"🔗 URL: {task['url']}",
                             task['user_id']
                         )
-                # 2ï¸âƒ£ If no failed trial (or not s2), pick a normal pending task
+                # 2️⃣ If no failed trial (or not s2), pick a normal pending task
                 if not task:
                     cur.execute("""
                         SELECT t.*
                         FROM trial AS t
                         WHERE t.status = 'pending'
                           AND t.crawler_version = %s
-                          AND (t.server_id IS NULL OR t.server_id != %s)
+                          AND (NOT t.is_user_retry OR t.retry_server_id = %s)
+                          AND (t.is_user_retry OR t.server_id IS NULL OR t.server_id != %s)
                         ORDER BY
+                            CASE WHEN t.is_user_retry THEN 0 ELSE 1 END,
                             CASE
                                 WHEN (
                                     SELECT COUNT(*)
@@ -3390,7 +3529,7 @@ def process_trial_loop():
                             t.id ASC
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
-                    """, (ALLOWED_CRAWLER, SERVER_ID))
+                    """, (ALLOWED_CRAWLER, SERVER_ID, SERVER_ID))
 
                     task = cur.fetchone()
 
@@ -3438,11 +3577,11 @@ def crawl_task(task):
     os.makedirs(temp_folder, exist_ok=True)
 
 
-    # âš ï¸ wtr-lab warning (non-blocking)
+    # ⚠️ wtr-lab warning (non-blocking)
     if "wtr" in url.lower():
         send_task_message(
             chat_id,
-            "âš ï¸ Notice:\n"
+            "⚠️ Notice:\n"
             "This bot currently does NOT fully support wtr-lab.\n\n"
             "You'll probably receive an EPUB with the first ten chapters only.\n"
             "send /webtoepub to see how to download from unsupported sites like wtr-lab",
@@ -3451,28 +3590,24 @@ def crawl_task(task):
     elif any(site in url.lower() for site in ["novelhall", "fanmtl"]):
         send_task_message(
             chat_id,
-            "âš ï¸ Notice:\nThis download might fail then retry once, please be patient.\n\n",
+            "⚠️ Notice:\nThis download might fail then retry once, please be patient.\n\n",
             user_id
         )
 
     send_long_temp_message(
         chat_id,
-        "ðŸ“š Downloading novel...\nUse /cancel to stop.\nUse /download to create a new task to be queued.",
+        "📚 Downloading novel...\nUse /cancel to stop.\nUse /download to create a new task to be queued.",
         user_id
     )
 
     # ---------------- direct library call, live progress (both v3 and v4) ----------------
     range_desc_holder = {"desc": format_range_desc(chapter_range, task.get('total_chapters') or 0)}
-    title_line = f"ðŸ“– {task['novel_title']}\n\n" if task.get('novel_title') else ""
+    title_line = f"📖 {task['novel_title']}\n\n" if task.get('novel_title') else ""
 
     def on_total_known(total):
         range_desc_holder["desc"] = format_range_desc(chapter_range, total)
 
-<<<<<<< HEAD
     progress_msg = send_task_message_24h(chat_id, f"{title_line}📥 Downloading Task {task_id}...\n\n📊 Progress: 0.0%", user_id)
-=======
-    progress_msg = send_task_message_24h(chat_id, f"{title_line}ðŸ“¥ Downloading Task {task_id}...\n\nðŸ“Š Progress: 0.0%", user_id)
->>>>>>> 90f74383943a9343619f6ed87d7235bfac1b796a
     cancel_event = threading.Event()
     crawl_started_at = time.time()
     with running_lock:
@@ -3516,7 +3651,6 @@ def crawl_task(task):
             remaining = speed * max(0, total - done) if speed else 0.0
             text = (
                 f"{title_line}"
-<<<<<<< HEAD
                 f"📥 Downloading Task {task_id}...\n\n"
                 f"📊 Progress: {pct:.1f}%\n"
                 f"📖 Currently At: Chapter {done}\n"
@@ -3525,16 +3659,6 @@ def crawl_task(task):
                 f"⏱ Elapsed: {format_progress_duration(elapsed)}\n"
                 f"⌛ Remaining: {format_progress_duration(remaining)}\n"
                 f"⚡ Speed: {speed:.2f} s/chapter"
-=======
-                f"ðŸ“¥ Downloading Task {task_id}...\n\n"
-                f"ðŸ“Š Progress: {pct:.1f}%\n"
-                f"ðŸ“– Currently At: Chapter {done}\n"
-                f"ðŸ” Range: from {range_desc_holder['desc']}\n\n"
-                f"ðŸ“Œ Status: Downloading chapters ({done}/{total})\n\n"
-                f"â± Elapsed: {format_progress_duration(elapsed)}\n"
-                f"âŒ› Remaining: {format_progress_duration(remaining)}\n"
-                f"âš¡ Speed: {speed:.2f} s/chapter"
->>>>>>> 90f74383943a9343619f6ed87d7235bfac1b796a
             )
             try:
                 bot.edit_message_text(text, chat_id, progress_msg.message_id)
@@ -3549,9 +3673,9 @@ def crawl_task(task):
             _touch_progress(task_id)
             text = (
                 f"{title_line}"
-                "ðŸ–¼ Downloading images...\n\n"
-                f"ðŸ“Š Progress: {pct:.1f}%\n"
-                f"ðŸ“Œ Status: Fetching embedded images ({done}/{total})"
+                "🖼 Downloading images...\n\n"
+                f"📊 Progress: {pct:.1f}%\n"
+                f"📌 Status: Fetching embedded images ({done}/{total})"
             )
             try:
                 bot.edit_message_text(text, chat_id, progress_msg.message_id)
@@ -3560,19 +3684,21 @@ def crawl_task(task):
 
     try:
         if task['crawler_version'] == "v4":
-            epub_path, actual_total_chapters, novel_title, novel_synopsis, cover_source = crawl_v4_with_progress(
+            epub_path, actual_total_chapters, novel_title, novel_synopsis, cover_source, missing_chapter_count, cache_novel_id = crawl_v4_with_progress(
                 url,
                 chapter_range,
                 on_progress,
                 cancel_event,
                 on_image_progress=on_image_progress,
                 on_total_known=on_total_known,
-
+                resume_missing=bool(task.get("is_user_retry")),
             )
         else:
             epub_path, actual_total_chapters, novel_title, novel_synopsis, cover_source = crawl_v3_with_progress(
                 url, chapter_range, on_progress, cancel_event, on_image_progress=on_image_progress, on_total_known=on_total_known
             )
+            missing_chapter_count = 0
+            cache_novel_id = None
     except Exception as e:
         import traceback
         stop_watcher.set()
@@ -3591,15 +3717,15 @@ def crawl_task(task):
         try:
             send_task_message(
                 chat_id,
-                f"âš ï¸ Download failed: {type(e).__name__}: {e}\n\n"
-                f"ðŸ”— {url}\n\n"
+                f"⚠️ Download failed: {type(e).__name__}: {e}\n\n"
+                f"🔗 {url}\n\n"
                 f"Please check the link and make sure it leads to the novel info page. "
                 f"Or send /sources to check if the site is supported.",
                 user_id
             )
         except Exception as notify_err:
             print(f"[NOTIFY ERROR] Task {task_id}: {notify_err}")
-        mark_failed(task_id)
+        mark_failed(task_id, keep_retryable=bool(task.get("is_user_retry")))
         shutil.rmtree(temp_folder, ignore_errors=True)
         return
     
@@ -3629,7 +3755,7 @@ def crawl_task(task):
     try:
         final_msg = send_temp_message(
             chat_id,
-            "âœ… Download completed!\nYou will receive your file soon...\nBackup file will be sent to @novelsFinder\n",
+            "✅ Download completed!\nYou will receive your file soon...\nBackup file will be sent to @novelsFinder\n",
             user_id
         )
 
@@ -3742,15 +3868,30 @@ def crawl_task(task):
                             WHEN status = 'upload_failed' THEN 'upload_failed'
                             ELSE 'done'
                         END,
-                        completed_at=NOW()
+                        completed_at=NOW(),
+                        missing_chapters=%s,
+                        retry_expires_at=COALESCE(
+                            retry_expires_at,
+                            NOW() + (%s * INTERVAL '1 hour')
+                        ),
+                        is_user_retry=FALSE,
+                        cache_novel_id=COALESCE(%s, cache_novel_id)
                         WHERE id=%s AND status!='cancelled'
                         """,
-                        (task['id'],)
+                        (missing_chapter_count, USER_RETRY_WINDOW_HOURS, cache_novel_id, task['id']),
                     )
 
                 conn.commit()
             finally:
                 conn.close()
+
+        if missing_chapter_count:
+            send_task_message(
+                chat_id,
+                f"⚠️ This EPUB was delivered with {missing_chapter_count} missing chapter(s).\n\n"
+                "Send /retry within 20 hours, then submit this same novel link to retry only the missing chapters.",
+                user_id,
+            )
 
     except Exception as e:
         import traceback
@@ -3758,9 +3899,9 @@ def crawl_task(task):
         traceback.print_exc()
         send_temp_message(
             chat_id,
-            f"âš ï¸ Your novel finished downloading, but sending the file to Telegram failed "
+            f"⚠️ Your novel finished downloading, but sending the file to Telegram failed "
             f"after several attempts (likely a slow connection, try splitting the chapters into 2, download the first half then the last half): {type(e).__name__}: {e}\n\n"
-            f"ðŸ”— {url}\n\n",
+            f"🔗 {url}\n\n",
             user_id
         )
 
@@ -3780,6 +3921,80 @@ def crawl_task(task):
         with running_lock:
             running_processes.pop(task_id, None)
         shutil.rmtree(temp_folder, ignore_errors=True)
+
+
+def cleanup_expired_retry_cache():
+    """Remove local v4 chapter caches only after their retry window has ended."""
+    if ALLOWED_CRAWLER != "v4":
+        return
+
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, url, cache_novel_id
+                FROM trial
+                WHERE crawler_version='v4'
+                  AND server_id=%s
+                  AND status='done'
+                  AND retry_expires_at < NOW() - INTERVAL '4 hours'
+                  AND cache_novel_id IS NOT NULL
+                ORDER BY retry_expires_at ASC
+                LIMIT 20;
+            """, (SERVER_ID,))
+            expired_tasks = cur.fetchall()
+
+        for task in expired_tasks:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 1
+                    FROM trial
+                    WHERE server_id=%s
+                      AND rtrim(url, '/')=rtrim(%s, '/')
+                      AND id != %s
+                      AND (
+                          status IN ('pending', 'running')
+                          OR (status='done' AND retry_expires_at > NOW())
+                      )
+                    LIMIT 1;
+                """, (SERVER_ID, task['url'], task['id']))
+                if cur.fetchone():
+                    continue
+
+            try:
+                ctx, _ = _v4()
+                from lncrawl.dao.novel import Novel
+
+                with ctx.db.session() as session:
+                    novel = session.get(Novel, task['cache_novel_id'])
+                    if novel:
+                        session.delete(novel)
+                        session.commit()
+                shutil.rmtree(ctx.files.resolve(f"novels/{task['cache_novel_id']}"), ignore_errors=True)
+
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE trial SET cache_novel_id=NULL WHERE id=%s AND cache_novel_id=%s",
+                        (task['id'], task['cache_novel_id']),
+                    )
+                conn.commit()
+                print(f"[RETRY CACHE CLEANUP] Removed Task {task['id']} cache")
+            except Exception as error:
+                conn.rollback()
+                print(f"[RETRY CACHE CLEANUP ERROR] Task {task['id']}: {error}")
+    finally:
+        conn.close()
+
+
+def retry_cache_cleanup_loop():
+    while True:
+        try:
+            cleanup_expired_retry_cache()
+        except Exception as error:
+            print(f"[RETRY CACHE CLEANUP LOOP ERROR] {error}")
+        time.sleep(60 * 30)
 
 
 # ---------------------- CLEANUP ----------------------
@@ -3847,7 +4062,7 @@ def reap_orphaned_trial():
                         try:
                             send_task_message(
                                 t['chat_id'],
-                                "âš ï¸ Your download was interrupted by a server restart. Retrying automatically, or send /download again.",
+                                "⚠️ Your download was interrupted by a server restart. Retrying automatically, or send /download again.",
                                 t['user_id']
                             )
                         except Exception:
@@ -3914,7 +4129,7 @@ def check_dead_servers(timeout_seconds=15):
 
                         last_seen = server['last_heartbeat'] + datetime.timedelta(hours=3)
                         last_seen_str = last_seen.strftime("%d-%m-%Y %H:%M:%S")
-                        msg = f"âš ï¸ Server {server_id} is dead! Last heartbeat: {last_seen_str}"
+                        msg = f"⚠️ Server {server_id} is dead! Last heartbeat: {last_seen_str}"
                         print(msg)
                         try:
                             bot.send_message(OTHER_GROUP_ID, msg)
@@ -3939,11 +4154,16 @@ def cleanup_old_trial():
         if conn:
             try:
                 with conn.cursor() as cur:
-                    # Delete trial completed/cancelled more than 1 day ago
+                    # Keep retry-eligible tasks until their 20-hour retry window and
+                    # 24-hour local-cache retention period have both elapsed.
                     cur.execute("""
                         DELETE FROM trial
                         WHERE created_at IS NOT NULL
-                        AND created_at < NOW() - INTERVAL '1 day';
+                          AND created_at < NOW() - INTERVAL '1 day'
+                          AND (
+                              retry_expires_at IS NULL
+                              OR retry_expires_at < NOW() - INTERVAL '4 hours'
+                          );
                     """)
                     conn.commit()
             except Exception as e:
@@ -4112,6 +4332,7 @@ def cleanup_expired_pending_uploads():
 threading.Thread(target=cleanup_old_trial, daemon=True).start()
 threading.Thread(target=process_pending_upload_retries, daemon=True).start()
 threading.Thread(target=cleanup_expired_pending_uploads, daemon=True).start()
+threading.Thread(target=retry_cache_cleanup_loop, daemon=True).start()
 
 
 # ---------------------- RUN BOT ----------------------
