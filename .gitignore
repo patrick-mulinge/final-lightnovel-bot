@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+novels/
+pending_epub_uploads/
+.pytest_cache/
+.git/
+new sources/
+**/__pycache__/
+*.py[cod]

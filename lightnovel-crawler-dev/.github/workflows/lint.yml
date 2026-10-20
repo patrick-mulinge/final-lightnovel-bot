@@ -1,0 +1,79 @@
+name: Lint & Test
+
+on:
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      run_crawl_test:
+        description: Run live crawl integration test (release and other callers)
+        type: boolean
+        default: false
+  push:
+    branches:
+      - master
+      - dev
+    paths:
+      - "lncrawl/**"
+      - "sources/**/*.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/lint.yml"
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - "lncrawl/**"
+      - "sources/**/*.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/lint.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    name: Python ${{ matrix.python-version }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+
+      - name: 🐍 Install uv & Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: 📦 Install Dependencies
+        run: uv sync --frozen --all-extras --all-groups
+
+      - name: 🧹 Lint Code
+        run: |
+          uv run pyright lncrawl
+          uv run ruff format --diff --check
+          uv run ruff check
+          git diff --name-only -- "*.py" | xargs -r pyright
+
+      - name: 🏗️ Build Wheel
+        run: uv run python -m build --wheel --no-isolation
+
+      - name: 🧪 Test Installation
+        run: pip install dist/lightnovel_crawler*.whl
+
+      - name: 🧪 Check lncrawl
+        run: lncrawl -ll sources list
+
+      - name: Detect Database Drift
+        run: lncrawl -ll dev migrate verify
+
+      - name: 🧪 Test Crawl
+        if: ${{ github.event_name == 'workflow_dispatch' || inputs.run_crawl_test == true }}
+        run: lncrawl -ll crawl 'https://novelfull.com/dungeon-defense.html' --first 2 --format epub --noin

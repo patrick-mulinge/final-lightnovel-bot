@@ -1,0 +1,55 @@
+name: Generate source index
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - dev
+    paths:
+      - "sources/**"
+      - "!sources/_index.json"
+      - "!sources/_index.zip"
+      - "scripts/index_gen.py"
+      - "scripts/check_sources.py"
+      - "lncrawl/VERSION"
+      - ".github/workflows/index-gen.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  index_gen:
+    if: github.repository == 'lncrawl/lightnovel-crawler'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Install uv & Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: 📦 Install Dependencies
+        run: uv sync --frozen
+
+      - name: ⚙️ Generate Index
+        run: uv run python ./scripts/index_gen.py
+
+      - name: ✅ Commit and Push Index
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: Generate source index
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: sources/_index.zip
+          name: index.zip

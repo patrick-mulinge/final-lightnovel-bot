@@ -1,0 +1,82 @@
+name: lncrawl
+
+services:
+  server:
+    image: lncrawl
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    command: -ll server -p 8181
+    environment:
+      - LNCRAWL_DATA_PATH=/data
+      - DATABASE_URL=postgresql+psycopg://pguser:pgpass@postgres:5432/lncrawl
+      - PROXY_URLS=torpool;http://tor-pool:8080;socks5h://tor-pool:9250;tp_auth_disabled
+      - TZ=${TZ:-UTC}
+    volumes:
+      - appdata:/data
+    depends_on:
+      - postgres
+      - calibre-api
+      - translator
+      - tor-pool
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    platform: linux/amd64
+    shm_size: 128mb
+    ports:
+      - "0.0.0.0:5432:5432"
+    environment:
+      POSTGRES_DB: lncrawl
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  calibre-api:
+    image: ghcr.io/lncrawl/ebook-convert-api:v0.2.0
+    restart: unless-stopped
+    ports:
+      - "8182:8000"
+    environment:
+      MAX_UPLOAD_MB: "1024"
+      MAX_CONCURRENT_JOBS: "4"
+      CONVERSION_TIMEOUT_SECONDS: "300"
+
+  # Reached by the server at http://translator:8184 (set translator.api_url in
+  # admin settings). Port is intentionally NOT published: the service is
+  # unauthenticated, so it stays on the internal network and the dashboard is
+  # reached only through the server's admin-only /api/translator proxy.
+  translator:
+    image: ghcr.io/lncrawl/translator:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: "INFO"
+    volumes:
+      - translator_data:/data
+
+  # Many tor instances behind one sticky SOCKS port. Ports stay on loopback: there is
+  # no TLS, so the token and the dashboard password would travel in cleartext.
+  tor-pool:
+    image: ghcr.io/lncrawl/tor-pool:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9250:9250" # socks5 proxy — user is the session key, password the token
+      - "127.0.0.1:9251:9251" # http CONNECT proxy
+      - "127.0.0.1:8183:8080" # dashboard + REST API
+    volumes:
+      - tor_data:/var/lib/tor
+    environment:
+      POOL_SIZE: "3"
+      MIN_READY: "1"
+      AUTH_DISABLED: "true"
+      PIN_EXIT_RELAY: "true"
+
+volumes:
+  pgdata:
+  appdata:
+  tor_data:
+  translator_data:

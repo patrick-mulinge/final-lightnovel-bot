@@ -1,0 +1,127 @@
+services:
+  autoheal:
+    image: willfarrell/autoheal:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 30
+      AUTOHEAL_START_PERIOD: 90
+    deploy:
+      resources:
+        limits:
+          memory: "64M"
+
+  postgres:
+    image: postgres:alpine
+    restart: unless-stopped
+    shm_size: 128mb
+    environment:
+      POSTGRES_DB: lncrawl
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpass
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "1G"
+
+  server:
+    image: ghcr.io/lncrawl/lightnovel-crawler:latest
+    init: true
+    ports:
+      - "23457:8080"
+    command: -ll server -p 8080
+    restart: unless-stopped
+    environment:
+      - LNCRAWL_DATA_PATH=/data
+      - DATABASE_URL=postgresql+psycopg://pguser:pgpass@postgres:5432/lncrawl
+      - PROXY_URLS=torpool;http://tor-pool:8080;socks5h://tor-pool:9250;tp_auth_disabled
+      - TZ=${TZ:-UTC}
+      - MALLOC_ARENA_MAX=2
+    volumes:
+      - ./appdata:/data
+    labels:
+      - autoheal=true
+    healthcheck:
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - |
+          import sys, urllib.request;
+          r = urllib.request.urlopen('http://localhost:8080/health', timeout=10);
+          sys.exit(0 if r.status==200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    cap_add:
+      - SYS_PTRACE
+    deploy:
+      resources:
+        limits:
+          cpus: "3.50"
+          memory: "5G"
+
+  calibre-api:
+    image: ghcr.io/lncrawl/ebook-convert-api:v0.2.0
+    restart: unless-stopped
+    environment:
+      MAX_UPLOAD_MB: "100"
+      MAX_CONCURRENT_JOBS: "3"
+      CONVERSION_TIMEOUT_SECONDS: "600"
+    ports:
+      - "0.0.0.0:23459:8000"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+    labels:
+      - autoheal=true
+    healthcheck:
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+      test:
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - |
+          import sys, urllib.request;
+          r = urllib.request.urlopen('http://localhost:8000/health', timeout=10);
+          sys.exit(0 if r.status==200 else 1)
+
+  tor-pool:
+    image: ghcr.io/lncrawl/tor-pool:latest
+    restart: unless-stopped
+    environment:
+      POOL_SIZE: "10"
+      MIN_READY: "1"
+      AUTH_DISABLED: "true"
+      PIN_EXIT_RELAY: "true"
+    ports:
+      - "0.0.0.0:23458:8080"
+    volumes:
+      - tordata:/var/lib/tor
+    labels:
+      - autoheal=true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: "768M"
+
+volumes:
+  tordata:

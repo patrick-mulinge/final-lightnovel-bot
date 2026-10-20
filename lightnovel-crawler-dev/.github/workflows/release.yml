@@ -1,0 +1,244 @@
+name: Build and Publish
+run-name: "Release ${{ github.ref_name }}"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    uses: ./.github/workflows/lint.yml
+    with:
+      run_crawl_test: true
+    permissions:
+      contents: read
+
+  sync-web:
+    uses: ./.github/workflows/web.yml
+    permissions:
+      contents: write
+    secrets: inherit
+
+  build-docker:
+    needs: [validate, sync-web]
+    uses: ./.github/workflows/build-docker.yml
+    permissions:
+      contents: read
+      packages: write
+
+  create-release:
+    name: Create GitHub Release
+    needs: [validate, sync-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 🏷️ Extract changelog
+        id: changelog
+        run: |
+          version=$(head -n 1 lncrawl/VERSION)
+          body=$(awk "/^## \[$version\]/{p=1; next} /^## \[/{if(p) exit} p" CHANGELOG.md)
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$body" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 Create draft release
+        uses: ncipollo/release-action@v1
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          draft: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    name: Build & Publish (Windows)
+    needs: [create-release]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 🧰 Install OpenSSL
+        run: choco install -y --no-progress openssl
+
+      - name: 🐍 Install uv & Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: 🏗️ Build Executable (onedir)
+        env:
+          PYTHONIOENCODING: utf-8
+          UV_PROJECT_ENVIRONMENT: .venv
+        run: |
+          uv sync --no-dev --extra build --extra lsp
+          uv run python -m build -w
+          uv run python setup_pyi.py
+
+      - name: 🧪 Test Executable
+        run: |
+          .\dist\lncrawl\lncrawl.exe -ll sources list
+          .\dist\lncrawl\lncrawl.exe -ll crawl 'https://novelfull.com/dungeon-defense.html' --first 2 --format epub --noin
+
+      - name: 📦 Build Installer
+        run: |
+          $version = (Get-Content "lncrawl/VERSION").Trim()
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "installer\installer.iss" `
+            "/DMyAppVersion=$version"
+
+      - name: 📦 Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lncrawl-windows
+          path: dist/lncrawl.exe
+          retention-days: 7
+
+      - name: 🚀 Release Artifact
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/lncrawl.exe"
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-mac:
+    name: Build & Publish (MacOS)
+    needs: [create-release]
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 🐍 Install uv & Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: 🏗️ Build Executable
+        env:
+          PYTHONIOENCODING: utf-8
+          UV_PROJECT_ENVIRONMENT: .venv
+        run: |
+          uv sync --no-dev --extra build --extra lsp
+          uv run python -m build -w
+          uv run python setup_pyi.py
+          mv ./dist/lncrawl ./dist/lncrawl-mac
+          ./dist/lncrawl-mac -ll sources list
+
+      - name: 📦 Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lncrawl-mac
+          path: dist/lncrawl-mac
+          retention-days: 7
+
+      - name: 🚀 Release Artifact
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/lncrawl-mac"
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux:
+    name: Build & Publish (Linux)
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 🐍 Install uv & Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: 🏗️ Build Executable
+        env:
+          PYTHONIOENCODING: utf-8
+          UV_PROJECT_ENVIRONMENT: .venv
+        run: |
+          uv sync --no-dev --extra build --extra lsp
+          uv run python -m build -w
+          uv run python setup_pyi.py
+          mv ./dist/lncrawl ./dist/lncrawl-linux
+          ./dist/lncrawl-linux -ll sources list
+
+      - name: 📦 Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: lncrawl-linux
+          path: |
+            dist/lncrawl-linux
+            dist/*.whl
+          retention-days: 7
+
+      - name: 🚀 Release Artifacts
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/lncrawl-linux,dist/*.whl"
+          allowUpdates: true
+          artifactErrorsFailBuild: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-package:
+    name: PyPI Publish
+    needs: [build-docker, build-windows, build-mac, build-linux]
+    if: github.repository == 'lncrawl/lightnovel-crawler'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write # PyPI Trusted Publishing (OIDC) via gh-action-pypi-publish
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 🐍 Install uv & Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: 🏗️ Build Executable
+        env:
+          PYTHONIOENCODING: utf-8
+          UV_PROJECT_ENVIRONMENT: .venv
+        run: |
+          uv sync --no-dev --extra build
+          uv run python -m build -w
+
+      - name: 📤 PyPI Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        env:
+          verbose: true
+          print-hash: true
+          password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: 🔗 Update Download Links
+        env:
+          SHLINK_API_KEY: ${{ secrets.SHLINK_API_KEY }}
+        run: sh ./scripts/bitanon.sh
+
+      - name: 🚀 Publish release
+        uses: ncipollo/release-action@v1
+        with:
+          draft: false
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
