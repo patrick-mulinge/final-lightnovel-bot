@@ -1,155 +1,122 @@
 # -*- coding: utf-8 -*-
+"""Crawler for LNMTL novels."""
+
 from concurrent import futures
 import json
 import logging
 import re
 
-import exejs
-
-from lncrawl.core import Chapter, LegacyCrawler, PageSoup
+from lncrawl.core import Chapter, LegacyCrawler
 
 logger = logging.getLogger(__name__)
-
-login_url = "https://lnmtl.com/auth/login"
-logout_url = "https://lnmtl.com/auth/logout"
 
 
 class LNMTLCrawler(LegacyCrawler):
     has_mtl = True
     base_url = "https://lnmtl.com/"
 
-    def login(self, email, password):
-        """login to LNMTL"""
-        # Get the login page
-        logger.info("Visiting %s", login_url)
-        soup = self.get_soup(login_url)
-        token = soup.select_one('form input[name="_token"]')["value"]
-        # Send post request to login
-        logger.info("Logging in...")
-        response = self.submit_form(
-            login_url,
-            data=dict(
-                _token=token,
-                email=email,
-                password=password,
-            ),
-        )
-        # Check if logged in successfully
-        soup = PageSoup.create(response.content, parser="lxml")
-        if soup.select_one('a[href="%s"]' % logout_url):
-            print("Logged in")
-        else:
-            body = soup.select_one("body").text
-            logger.debug("-" * 80)
-            logger.debug("\n\n".join([x for x in body.split("\n\n") if len(x.strip()) > 0]))
-            logger.debug("-" * 80)
-            logger.error("Failed to login")
-
     def read_novel_info(self):
-        """get list of chapters"""
-        logger.info("Visiting %s", self.novel_url)
         soup = self.get_soup(self.novel_url)
 
-        title = soup.select_one(".novel .media .novel-name").text
-        self.novel_title = title.rsplit(" ", 1)[0]
-        logger.debug("Novel title = %s", self.novel_title)
+        title_tag = soup.select_one(".novel .media .novel-name")
+        if not title_tag:
+            raise RuntimeError("LNMTL novel title was not found")
+        title = title_tag.get_text(" ", strip=True)
+        self.novel_title = title.rsplit(" ", 1)[0] if title else title
 
         try:
-            self.novel_cover = self.absolute_url(
-                soup.find("img", {"title": self.novel_title})["src"]
-            )
+            cover = soup.select_one(".novel .media img[title], .novel img.media-object")
+            if cover and cover.get("src"):
+                self.novel_cover = self.absolute_url(cover["src"])
         except Exception:
-            pass  # novel cover is not so important to raise errors
-        logger.info("Novel cover = %s", self.novel_cover)
+            logger.debug("LNMTL cover was not available", exc_info=True)
 
         self.parse_volume_list(soup)
-        self.volumes = sorted(self.volumes, key=lambda x: x["id"])
-
-        logger.info("Getting chapters...")
+        self.volumes.sort(key=lambda volume: volume["id"])
         self.download_chapter_list()
 
     def parse_volume_list(self, soup):
+        """Read the embedded volume JSON without relying on script position."""
         self.volumes = []
-        script = soup.find(name="main").find_next_sibling(name="script").string
+        script_text = ""
+        for script in soup.select("script"):
+            text = script.string or script.get_text()
+            if "lnmtl.volumes" in text:
+                script_text = text
+                break
 
-        try:
-            js_code = (
-                "(function() {var window = { lnmtl: {} }; var lnmtl = window.lnmtl;"
-                + script
-                + "return window.lnmtl;})()"
+        match = re.search(r"lnmtl\.volumes\s*=\s*(\[.*?\])\s*;", script_text, re.DOTALL)
+        if not match:
+            raise RuntimeError("LNMTL volume data was not found in the page")
+
+        volumes = json.loads(match.group(1))
+        if not isinstance(volumes, list):
+            raise RuntimeError("LNMTL volume data was not a list")
+
+        for index, volume in enumerate(volumes, start=1):
+            volume_id = volume.get("id")
+            if volume_id is None:
+                continue
+            self.volumes.append(
+                {
+                    "id": index,
+                    "title": (volume.get("title") or "").strip(),
+                    "download_id": volume_id,
+                }
             )
-            data = json.loads(exejs.evaluate(f"JSON.stringify({js_code})"))
-            assert isinstance(data, dict)
-            for i, vol in enumerate(data["volumes"]):
-                title = vol.get("title", "") or ""
-                title = re.sub(r"[^\u0000-\u00FF]", "", title)
-                title = re.sub(r"\(\)", "", title).strip()
-                self.volumes.append(
-                    {
-                        "id": i + 1,
-                        "title": title,
-                        "download_id": vol["id"],
-                    }
-                )
-        except Exception:
-            logger.exception("Failed parsing one possible batch")
 
-        if len(self.volumes) == 0:
-            raise Exception("Failed parsing volume list")
+        if not self.volumes:
+            raise RuntimeError("LNMTL returned no volumes")
 
     def download_chapter_list(self):
         futures_to_wait = [
             self.executor.submit(self.download_chapters_per_volume, volume)
             for volume in self.volumes
         ]
-
-        possible_chapters = {}
+        chapters_by_volume = {}
         for future in futures.as_completed(futures_to_wait):
-            vol_id, chapters = future.result()
-            possible_chapters[vol_id] = chapters
+            volume_id, chapters = future.result()
+            chapters_by_volume[volume_id] = chapters
 
         for volume in self.volumes:
-            for chapter in possible_chapters[volume["id"]]:
-                chap = dict(chapter)
-                chap["id"] = len(self.chapters) + 1
-                chap["volume"] = volume["id"]
-                self.chapters.append(Chapter(**chap))
+            for chapter in chapters_by_volume.get(volume["id"], []):
+                chapter = dict(chapter)
+                chapter["id"] = len(self.chapters) + 1
+                chapter["volume"] = volume["id"]
+                self.chapters.append(Chapter(**chapter))
 
     def download_chapters_per_volume(self, volume, page=1):
         url = self.absolute_url(f"/chapter?page={page}&volumeId={volume['download_id']}")
-        logger.info("Getting json: %s", url)
         result = self.get_json(url)
-
         chapters = []
-        for chapter in result["data"]:
-            title = chapter.get("title") or ""
-            if chapter.get("number"):
-                title = f"#{chapter.get('number')} {title}"
-            chapters.append(
-                {
-                    "title": title,
-                    "url": chapter["site_url"],
-                }
-            )
 
-        if page != 1:
-            return chapters
+        for item in result.get("data", []):
+            title = (item.get("title") or "").strip()
+            number = item.get("number")
+            if number:
+                title = f"#{number} {title}".strip()
+            chapter_url = item.get("site_url")
+            if chapter_url:
+                chapters.append({"title": title, "url": chapter_url})
 
-        for page in range(2, result["last_page"] + 1):
-            chapters += self.download_chapters_per_volume(volume, page)
-        return volume["id"], chapters
+        if page == 1:
+            for next_page in range(2, int(result.get("last_page", 1)) + 1):
+                chapters.extend(self.download_chapters_per_volume(volume, next_page))
+            return volume["id"], chapters
+
+        return chapters
 
     def download_chapter_body(self, chapter):
         soup = self.get_soup(chapter["url"])
-        body = soup.select(".chapter-body .translated")
-        body = [self.format_text(x.text) for x in body if x]
-        body = "\n".join(["<p>%s</p>" % (x) for x in body if len(x)])
-        return body.strip()
+        sentences = soup.select(".chapter-body .translated")
+        paragraphs = []
 
-    def format_text(self, text):
-        """formats the text and remove bad characters"""
-        text = text.replace("\u00ad", "")
-        text = re.sub(r"\u201e[, ]*", "&ldquo;", text)
-        text = re.sub(r"\u201d[, ]*", "&rdquo;", text)
-        text = re.sub(r"[ ]*,[ ]+", ", ", text)
-        return text.strip()
+        for sentence in sentences:
+            text = sentence.get_text(" ", strip=True)
+            text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                paragraphs.append(f"<p>{text}</p>")
+
+        return "\n".join(paragraphs)
+
