@@ -17,6 +17,16 @@ class NovelFireCrawler(LegacyCrawler):
     can_search = True
     request_rate_limit = 3
 
+    def _chapter_url(self, href: str) -> str:
+        """Normalize NovelFire's escaped external mirror links."""
+        from urllib.parse import unquote
+
+        value = unquote(href or "").replace("\\", "")
+        match = re.search(r"(?:https?://)?(novelphoenix\.com/novel/[^?#]+)", value)
+        if match:
+            return "https://" + match.group(1).rstrip("/")
+        return self.absolute_url(value)
+
     def read_novel_info(self) -> None:
         soup = self.get_soup(self.novel_url)
 
@@ -40,7 +50,7 @@ class NovelFireCrawler(LegacyCrawler):
                         id=chap_id,
                         volume=vol_id,
                         title=a["title"],
-                        url=self.absolute_url(a["href"]),
+                        url=self._chapter_url(a["href"]),
                     )
                 )
 

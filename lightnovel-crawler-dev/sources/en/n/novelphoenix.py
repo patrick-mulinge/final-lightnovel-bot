@@ -16,6 +16,7 @@ class NovelPhoenixCrawler(SoupTemplate):
     base_url = ["https://novelphoenix.com/"]
 
     novel_title_selector = "h1"
+    novel_synopsis_selector = "div.summary .content, div.description"
 
     # `article` and `main` also hold the text, but each wraps it in the post header.
     chapter_body_selector = "#content"
@@ -25,8 +26,20 @@ class NovelPhoenixCrawler(SoupTemplate):
     ) -> Iterable[PageSoup]:
         # The novel page links only the newest chapter; the list lives one level down.
         url = self.absolute_url(novel.url).split("?")[0].rstrip("/") + "/chapters"
-        soup = self.scraper.get_soup(url)
-        return soup.select("ul.chapter-list li a[href]")
+        seen = set()
+        while url and url not in seen:
+            seen.add(url)
+            soup = self.scraper.get_soup(url)
+            yield from soup.select("ul.chapter-list li a[href]")
+
+            links = soup.select("a.page-link[href*='chapters?page=']")
+            next_link = next(
+                (link for link in links if link.get_text(" ", strip=True) in {"?", ">", "Next"}),
+                None,
+            )
+            if not next_link:
+                break
+            url = self.absolute_url(next_link.get("href"))
 
     def parse_chapter_title(self, soup: PageSoup, chapter: Chapter) -> None:
         # A row runs number, title and timestamp together with no separators between the

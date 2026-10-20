@@ -1,4 +1,4 @@
-import telebot
+﻿import telebot
 import subprocess
 import os
 import shutil
@@ -3468,8 +3468,9 @@ def crawl_task(task):
     def on_total_known(total):
         range_desc_holder["desc"] = format_range_desc(chapter_range, total)
 
-    progress_msg = send_task_message_24h(chat_id, f"{title_line}📥 Downloading...\n\n📊 Progress: 0.0%", user_id)
+    progress_msg = send_task_message_24h(chat_id, f"{title_line}📥 Downloading Task {task_id}...\n\n📊 Progress: 0.0%", user_id)
     cancel_event = threading.Event()
+    crawl_started_at = time.time()
     with running_lock:
         running_processes[task_id] = cancel_event
 
@@ -3492,19 +3493,33 @@ def crawl_task(task):
 
     last_edit = {"t": 0.0}
 
+    def format_progress_duration(seconds):
+        seconds = max(0, int(round(seconds)))
+        minutes, secs = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
     def on_progress(done, total):
         pct = (done / total * 100) if total else 0
         now = time.time()
         if now - last_edit["t"] >= PROGRESS_UPDATE_INTERVAL or done == total:
             last_edit["t"] = now
             _touch_progress(task_id)
+            elapsed = max(0.0, now - crawl_started_at)
+            speed = elapsed / done if done else 0.0
+            remaining = speed * max(0, total - done) if speed else 0.0
             text = (
                 f"{title_line}"
-                "📥 Downloading...\n\n"
+                f"📥 Downloading Task {task_id}...\n\n"
                 f"📊 Progress: {pct:.1f}%\n"
                 f"📖 Currently At: Chapter {done}\n"
                 f"🔍 Range: from {range_desc_holder['desc']}\n\n"
-                f"📌 Status: Downloading chapters ({done}/{total})"
+                f"📌 Status: Downloading chapters ({done}/{total})\n\n"
+                f"⏱ Elapsed: {format_progress_duration(elapsed)}\n"
+                f"⌛ Remaining: {format_progress_duration(remaining)}\n"
+                f"⚡ Speed: {speed:.2f} s/chapter"
             )
             try:
                 bot.edit_message_text(text, chat_id, progress_msg.message_id)
@@ -4093,3 +4108,4 @@ else:
     print(f"[MODE] {SERVER_ID} – worker only (no polling)")
     while True:
         time.sleep(10)
+

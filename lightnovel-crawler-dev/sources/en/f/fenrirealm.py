@@ -1,7 +1,8 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import json
 import logging
 import re
+import time
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
 
@@ -79,7 +80,9 @@ class FenriRealm(LegacyCrawler):
 
         chapters_data.sort(key=lambda x: x["number"])
 
-        for chapter in chapters_data:
+        free_chapters = [ch for ch in chapters_data if ch["locked"]["price"] == 0]
+
+        for chapter in free_chapters:
             chap_id = len(self.chapters) + 1
             vol_id = 1 + len(self.chapters) // 100
 
@@ -106,6 +109,34 @@ class FenriRealm(LegacyCrawler):
             )
 
     def download_chapter_body(self, chapter):
-        return self.cleaner.extract_contents(
-            self.get_soup(chapter.url).select_one("div#reader-area")
+        page = self.render_soup(
+            chapter.url,
+            wait_for="[id^='reader-area-'] p",
+            timeout=120,
         )
+        chapter_body = page.select_one("[id^='reader-area-']") if page else None
+        if chapter_body:
+            for tag in chapter_body.find_all("style"):
+                tag.decompose()
+
+            for tag in chapter_body.find_all(attrs={"aria-hidden": True}):
+                if str(tag.get("aria-hidden", "")).strip().lower() == "true":
+                    tag.decompose()
+
+        if not chapter_body:
+            return ""
+
+        # The reader toolbar and access-check widgets share the reader-area
+        # container. Chapter paragraphs are direct <p> children, so discard
+        # the surrounding controls before extracting the text.
+        for child in list(chapter_body.children):
+            if getattr(child, "name", None) != "p":
+                child.decompose()
+
+        body = self.cleaner.extract_contents(chapter_body)
+        time.sleep(10)
+        return body
+
+
+
+
