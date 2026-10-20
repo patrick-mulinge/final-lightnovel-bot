@@ -15,4 +15,4 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag final-lightnovel-bot:38.2
+      run: docker build . --file Dockerfile --tag patiorjunrick/final-lightnovel-bot:38.2
