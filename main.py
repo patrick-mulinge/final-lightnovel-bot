@@ -17,8 +17,8 @@ import telebot.apihelper as apihelper
 apihelper.READ_TIMEOUT = 120
 apihelper.CONNECT_TIMEOUT = 30
 
-import logging
-telebot.logger.setLevel(logging.DEBUG)
+#import logging
+#telebot.logger.setLevel(logging.DEBUG)
 
 # ---- NEW: v3 and v4 are both installed as a top-level package literally
 # named `lncrawl`, so a given server only ever has ONE of them on disk
@@ -111,14 +111,14 @@ def get_db_connection():
         print(f"[DB ERROR] Could not connect: {e}")
         return None
     
-def setup_trial_table():
+def setup_tasks_table():
     conn = get_db_connection()
     if not conn:
         return
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS trial (
+                CREATE TABLE IF NOT EXISTS tasks (
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT NOT NULL,
                     user_id BIGINT NOT NULL,
@@ -135,27 +135,27 @@ def setup_trial_table():
                 );
             """)
 
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS username TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS first_name TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS last_name TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS novel_title TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS total_chapters INT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS run_id TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMP;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS username TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_name TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_name TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS novel_title TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS total_chapters INT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_id TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_progress_at TIMESTAMP;")
             cur.execute(
-                "ALTER TABLE trial "
+                "ALTER TABLE tasks "
                 "ADD COLUMN IF NOT EXISTS retry_mode TEXT NOT NULL DEFAULT 'fast';"
             )
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS is_user_retry BOOLEAN NOT NULL DEFAULT FALSE;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_server_id TEXT;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_expires_at TIMESTAMP;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS missing_chapters INT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS retry_attempts INT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE trial ADD COLUMN IF NOT EXISTS cache_novel_id TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS is_user_retry BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS retry_server_id TEXT;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS retry_expires_at TIMESTAMP;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS missing_chapters INT NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS retry_attempts INT NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cache_novel_id TEXT;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_retry_slots (
                     user_id BIGINT NOT NULL,
-                    task_id INT NOT NULL REFERENCES trial(id) ON DELETE CASCADE,
+                    task_id INT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
                     first_retry_at TIMESTAMP NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (user_id, task_id)
                 );
@@ -165,19 +165,19 @@ def setup_trial_table():
                 ON user_retry_slots (user_id, first_retry_at);
             """)
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS trial_pending_picker_idx
-                ON trial (crawler_version, id)
+                CREATE INDEX IF NOT EXISTS tasks_pending_picker_idx
+                ON tasks (crawler_version, id)
                 WHERE status = 'pending';
             """)
 
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS trial_user_fairness_idx
-                ON trial (user_id, created_at)
+                CREATE INDEX IF NOT EXISTS tasks_user_fairness_idx
+                ON tasks (user_id, created_at)
                 WHERE status IN ('done', 'running');
             """)
 
             conn.commit()
-            print("[DB] trial table ready")
+            print("[DB] tasks table ready")
     except Exception as e:
         print(f"[DB SETUP ERROR] {e}")
     finally:
@@ -190,7 +190,7 @@ def setup_preview_table():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS preview_requestz (
+                CREATE TABLE IF NOT EXISTS preview_requests (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT,
                     chat_id BIGINT,
@@ -209,17 +209,17 @@ def setup_preview_table():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS username TEXT;")
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS first_name TEXT;")
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS last_name TEXT;")
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;")
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS run_id TEXT;")
-            cur.execute("ALTER TABLE preview_requestz ADD COLUMN IF NOT EXISTS retry_server_id TEXT;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS username TEXT;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS first_name TEXT;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS last_name TEXT;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS retry_count INT DEFAULT 0;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS run_id TEXT;")
+            cur.execute("ALTER TABLE preview_requests ADD COLUMN IF NOT EXISTS retry_server_id TEXT;")
 
             conn.commit()
-            print("[DB] preview_requestz table ready")
+            print("[DB] preview_requests table ready")
     except Exception as e:
-        print(f"[DB SETUP ERROR] preview_requestz: {e}")
+        print(f"[DB SETUP ERROR] preview_requests: {e}")
     finally:
         conn.close()
 
@@ -238,7 +238,7 @@ def setup_server_table():
             """)
             cur.execute("ALTER TABLE servers ADD COLUMN IF NOT EXISTS run_id TEXT;")
             conn.commit()
-            print("[DB] trial table ready")
+            print("[DB] tasks table ready")
     except Exception as e:
         print(f"[DB SETUP ERROR] {e}")
     finally:
@@ -393,7 +393,7 @@ conn = get_db_connection()
 if conn:
     print("[DB] Connected successfully")
     conn.close()
-    setup_trial_table()
+    setup_tasks_table()
     setup_preview_table()
     setup_server_table()
     setup_user_controls_table()
@@ -415,7 +415,7 @@ pending_prompts = {}  # user_id -> pending bot message
 last_bot_messages = {}  # user_id -> list of final messages
 pending_urls = {}
 pending_retry_urls = {}  # user_id -> chat_id; the next message must be the completed task URL
-pending_cancel_trial = {}  # user_id -> ordered list of cancelable trial, expires after 10 minutes
+pending_cancel_tasks = {}  # user_id -> ordered list of cancelable tasks, expires after 10 minutes
 
 pending_range_state = {}  # user_id -> {token, chat_id, url, version, title, total_chapters, user_id, username, first_name, last_name}
 
@@ -1162,7 +1162,7 @@ def request_preview(url, version, user_id, chat_id, username=None, first_name=No
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                INSERT INTO preview_requestz (user_id, chat_id, username, first_name, last_name, url, version)
+                INSERT INTO preview_requests (user_id, chat_id, username, first_name, last_name, url, version)
                 VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
             """, (user_id, chat_id, username, first_name, last_name, url, version))
             pid = cur.fetchone()['id']
@@ -1226,7 +1226,7 @@ def wait_for_preview(pid, timeout=7200, cancel_event=None):
             consecutive_db_failures = 0
             try:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT * FROM preview_requestz WHERE id=%s", (pid,))
+                    cur.execute("SELECT * FROM preview_requests WHERE id=%s", (pid,))
                     row = cur.fetchone()
             finally:
                 conn.close()
@@ -1249,7 +1249,7 @@ def _abandon_preview(pid):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE preview_requestz SET status='abandoned' WHERE id=%s AND status IN ('pending','processing')",
+                    "UPDATE preview_requests SET status='abandoned' WHERE id=%s AND status IN ('pending','processing')",
                     (pid,)
                 )
                 conn.commit()
@@ -1294,7 +1294,7 @@ def process_preview_loop():
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT * FROM preview_requestz
+                    SELECT * FROM preview_requests
                     WHERE status = 'pending'
                       AND version = %s
                       AND (retry_server_id IS NULL OR retry_server_id = %s)
@@ -1309,7 +1309,7 @@ def process_preview_loop():
                     continue
 
                 cur.execute("""
-                    UPDATE preview_requestz
+                    UPDATE preview_requests
                     SET server_id = %s, run_id = %s, status = 'processing'
                     WHERE id = %s
                       AND status = 'pending'
@@ -1329,7 +1329,7 @@ def process_preview_loop():
                 novel = preview_novel_v4(req['url']) if req['version'] == 'v4' else preview_novel_v3(req['url'])
                 with conn.cursor() as cur:
                     cur.execute("""
-                        UPDATE preview_requestz
+                        UPDATE preview_requests
                         SET status = 'done', title = %s, volume_count = %s,
                             chapter_count = %s, retry_server_id = NULL
                         WHERE id = %s;
@@ -1343,7 +1343,7 @@ def process_preview_loop():
                 if req['version'] == 'v4' and SERVER_ID != PREVIEW_RETRY_SERVER:
                     with conn.cursor() as cur:
                         cur.execute("""
-                            UPDATE preview_requestz
+                            UPDATE preview_requests
                             SET status = 'pending', server_id = NULL, run_id = NULL,
                                 retry_server_id = %s, retry_count = retry_count + 1,
                                 error = %s
@@ -1362,7 +1362,7 @@ def process_preview_loop():
                 if req['version'] == 'v4':
                     with conn.cursor() as cur:
                         cur.execute("""
-                            UPDATE preview_requestz
+                            UPDATE preview_requests
                             SET status = 'failed', error = %s, retry_count = retry_count + 1,
                                 retry_server_id = NULL
                             WHERE id = %s AND status = 'processing';
@@ -1375,7 +1375,7 @@ def process_preview_loop():
                 if retry_count >= MAX_RETRIES:
                     with conn.cursor() as cur:
                         cur.execute("""
-                            UPDATE preview_requestz
+                            UPDATE preview_requests
                             SET status = 'failed', error = %s, retry_count = %s
                             WHERE id = %s AND status = 'processing';
                         """, (error_text, retry_count, req['id']))
@@ -1384,7 +1384,7 @@ def process_preview_loop():
                 else:
                     with conn.cursor() as cur:
                         cur.execute("""
-                            UPDATE preview_requestz
+                            UPDATE preview_requests
                             SET status = 'pending', server_id = NULL, run_id = NULL,
                                 retry_count = %s, error = %s
                             WHERE id = %s AND status = 'processing';
@@ -1402,7 +1402,7 @@ def cleanup_old_preview():
             try:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        DELETE FROM preview_requestz
+                        DELETE FROM preview_requests
                         WHERE created_at < NOW() - INTERVAL '1 day';
                     """)
                     conn.commit()
@@ -1424,7 +1424,7 @@ def reap_orphaned_previews():
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""
                         SELECT p.id
-                        FROM preview_requestz p
+                        FROM preview_requests p
                         LEFT JOIN servers s ON s.server_id = p.server_id
                         WHERE p.status = 'processing'
                           AND (
@@ -1437,7 +1437,7 @@ def reap_orphaned_previews():
                     orphaned = cur.fetchall()
                     if orphaned:
                         cur.execute("""
-                            UPDATE preview_requestz
+                            UPDATE preview_requests
                             SET status='pending', server_id=NULL, run_id=NULL
                             WHERE id = ANY(%s)
                         """, ([o['id'] for o in orphaned],))
@@ -1910,7 +1910,7 @@ def upload_external_fallback(upload_id, task_id, chat_id, title, file_path):
     else:
         print(f"[EXTERNAL UPLOAD FAILED] Task {task_id}")
 # ---------------------- BOT COMMANDS ----------------------
-if SERVER_ID == "s4":
+if SERVER_ID == "s1":
     @bot.message_handler(commands=['start'])
     def start(message):
         send_long_temp_message(
@@ -1920,7 +1920,7 @@ if SERVER_ID == "s4":
             "Use /cancel to stop all your ongoing or queued downloads.\n"
             "Use /retry after an EPUB reports missing chapters (available for 20 hours).\n"
             "Use /queue to view pending downloads and see if the bot is busy.\n"
-            "Use /trial to check bot downloads for the past 24 hours.\n"
+            "Use /tasks to check bot downloads for the past 24 hours.\n"
             "Use /sources to see supported websites.\n"
             "Use /webtoepub for tutorials to download from unsupported websites or websites that are failing.\n\n",
             message.from_user.id
@@ -1953,7 +1953,7 @@ if SERVER_ID == "s4":
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT user_id, username
-                        FROM trial
+                        FROM tasks
                         WHERE LOWER(username) = %s
                         ORDER BY created_at DESC
                         LIMIT 1;
@@ -2263,10 +2263,10 @@ if SERVER_ID == "s4":
             "To ask for more sources to be added, or to report broken sources, create an issue here: https://github.com/dipu-bd/lightnovel-crawler/issues/new/choose"
         )
         send_long_temp_message(message.chat.id, text, message.from_user.id)
-    def cancel_selected_trial(user_id, chat_id, task_ids):
+    def cancel_selected_tasks(user_id, chat_id, task_ids):
         """Cancel only task IDs that still belong to this user and are pending/running."""
         if not task_ids:
-            send_temp_message(chat_id, "ℹ️ No trial were selected.", user_id)
+            send_temp_message(chat_id, "ℹ️ No tasks were selected.", user_id)
             return
 
         conn = get_db_connection()
@@ -2277,7 +2277,7 @@ if SERVER_ID == "s4":
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE trial
+                    UPDATE tasks
                     SET status = 'cancelled'
                     WHERE user_id = %s
                       AND id = ANY(%s)
@@ -2285,20 +2285,20 @@ if SERVER_ID == "s4":
                     RETURNING id, status;
                 """, (user_id, task_ids))
 
-                cancelled_trial = cur.fetchall()
+                cancelled_tasks = cur.fetchall()
                 conn.commit()
 
-            if not cancelled_trial:
+            if not cancelled_tasks:
                 send_temp_message(
                     chat_id,
-                    "ℹ️ None of those trial were still pending or running.",
+                    "ℹ️ None of those tasks were still pending or running.",
                     user_id,
                 )
                 return
 
-            # Stop only selected locally-running trial.
+            # Stop only selected locally-running tasks.
             with running_lock:
-                for task in cancelled_trial:
+                for task in cancelled_tasks:
                     cancel_event = running_processes.pop(task["id"], None)
                     if cancel_event:
                         try:
@@ -2306,7 +2306,7 @@ if SERVER_ID == "s4":
                         except Exception:
                             pass
 
-            cancelled_ids = ", ".join(str(task["id"]) for task in cancelled_trial)
+            cancelled_ids = ", ".join(str(task["id"]) for task in cancelled_tasks)
             send_temp_message(
                 chat_id,
                 f"❌ Cancelled task(s): {cancelled_ids}",
@@ -2323,7 +2323,7 @@ if SERVER_ID == "s4":
         """Forget the numbered list after 10 minutes."""
         def expire():
             time.sleep(delay)
-            pending_cancel_trial.pop(user_id, None)
+            pending_cancel_tasks.pop(user_id, None)
 
         threading.Thread(target=expire, daemon=True).start()
 
@@ -2332,8 +2332,8 @@ if SERVER_ID == "s4":
         user_id = message.from_user.id
         chat_id = message.chat.id
 
-        trial = pending_cancel_trial.pop(user_id, None)
-        if not trial:
+        tasks = pending_cancel_tasks.pop(user_id, None)
+        if not tasks:
             send_temp_message(
                 chat_id,
                 "⌛ Your cancellation list expired. Send /cancel again.",
@@ -2356,7 +2356,7 @@ if SERVER_ID == "s4":
             )
             return
 
-        task_ids_in_list = {task["id"] for task in trial}
+        task_ids_in_list = {task["id"] for task in tasks}
         selected_ids = set()
         ignored_inputs = []
 
@@ -2371,8 +2371,8 @@ if SERVER_ID == "s4":
             # Exact task ID has priority over the list position.
             if value in task_ids_in_list:
                 selected_ids.add(value)
-            elif 1 <= value <= len(trial):
-                selected_ids.add(trial[value - 1]["id"])
+            elif 1 <= value <= len(tasks):
+                selected_ids.add(tasks[value - 1]["id"])
             else:
                 ignored_inputs.append(token)
 
@@ -2380,14 +2380,14 @@ if SERVER_ID == "s4":
             ignored_text = ", ".join(ignored_inputs) or "your input"
             send_temp_message(
                 chat_id,
-                f"❌ No matching trial found. Ignored: {ignored_text}\n\n"
-                "Send /cancel and select trial again.",
+                f"❌ No matching tasks found. Ignored: {ignored_text}\n\n"
+                "Send /cancel and select tasks again.",
                 user_id,
             )
             return
 
         # Valid selections are cancelled even if other entries were invalid.
-        cancel_selected_trial(user_id, chat_id, list(selected_ids))
+        cancel_selected_tasks(user_id, chat_id, list(selected_ids))
 
         if ignored_inputs:
             send_temp_message(
@@ -2424,7 +2424,7 @@ if SERVER_ID == "s4":
                 with conn.cursor() as cur:
                     cur.execute("""
                         SELECT id
-                        FROM trial
+                        FROM tasks
                         WHERE user_id = %s
                           AND status IN ('pending', 'running')
                         ORDER BY id ASC;
@@ -2433,7 +2433,7 @@ if SERVER_ID == "s4":
             finally:
                 conn.close()
 
-            cancel_selected_trial(user_id, chat_id, task_ids)
+            cancel_selected_tasks(user_id, chat_id, task_ids)
             bot.answer_callback_query(call.id)
             return
 
@@ -2459,26 +2459,26 @@ if SERVER_ID == "s4":
                         chapter_range,
                         created_at,
                         completed_at
-                    FROM trial
+                    FROM tasks
                     WHERE user_id = %s
                       AND status IN ('pending', 'running')
                     ORDER BY id ASC;
                 """, (user_id,))
-                trial = cur.fetchall()
+                tasks = cur.fetchall()
         finally:
             conn.close()
 
-        if not trial:
-            bot.answer_callback_query(call.id, "No trial to cancel.")
+        if not tasks:
+            bot.answer_callback_query(call.id, "No tasks to cancel.")
             send_temp_message(chat_id, "ℹ️ No pending or running downloads to cancel.", user_id)
             return
 
         # Save only this user's task list; later input cannot cancel anyone else's task.
-        pending_cancel_trial[user_id] = trial
+        pending_cancel_tasks[user_id] = tasks
         cancel_selection_timeout(user_id)
 
         text = "📋 Your pending/running downloads:\n\n"
-        for number, task in enumerate(trial, start=1):
+        for number, task in enumerate(tasks, start=1):
             server = task["server_id"] or "Not assigned"
             completed = task["completed_at"] or "Not completed"
 
@@ -2494,7 +2494,7 @@ if SERVER_ID == "s4":
                 f"-----------------------------\n"
             )
 
-        # Same long temporary-message behavior as your /trial-style lists.
+        # Same long temporary-message behavior as your /tasks-style lists.
         send_temp_long_message(chat_id, text, user_id)
 
         send_temp_message(
@@ -2530,7 +2530,7 @@ if SERVER_ID == "s4":
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT COUNT(*) AS task_count
-                    FROM trial
+                    FROM tasks
                     WHERE user_id = %s
                       AND status IN ('pending', 'running');
                 """, (user_id,))
@@ -2553,7 +2553,7 @@ if SERVER_ID == "s4":
                 callback_data="cancel_all",
             ),
             telebot.types.InlineKeyboardButton(
-                "📋 Select trial",
+                "📋 Select tasks",
                 callback_data="cancel_select",
             ),
         )
@@ -2584,7 +2584,7 @@ if SERVER_ID == "s4":
                 cur.execute("""
                     SELECT id, user_id, username, first_name, last_name, chat_id, url, version, status, title,
                         volume_count, chapter_count, error, server_id, created_at
-                    FROM preview_requestz
+                    FROM preview_requests
                     ORDER BY created_at
                 """)
                 rows = cur.fetchall()
@@ -2635,12 +2635,12 @@ if SERVER_ID == "s4":
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, user_id, url, chapter_range, status, server_id, crawler_version, created_at
-                    FROM trial
+                    FROM tasks
                     WHERE status='pending'
                     ORDER BY created_at
                 """)
-                trial = cur.fetchall()
-                if not trial:
+                tasks = cur.fetchall()
+                if not tasks:
                     send_temp_message(
                         message.chat.id,
                         "ℹ️ Queue is empty.",
@@ -2648,9 +2648,9 @@ if SERVER_ID == "s4":
                     )
                     return
 
-                text = "📋 Pending trial Queue:\n\n"
+                text = "📋 Pending tasks Queue:\n\n"
 
-                for t in trial:
+                for t in tasks:
                     text += (
                         f"🆔 Task ID: {t['id']}\n"
                         f"👤 User ID: {t['user_id']}\n"
@@ -2674,8 +2674,8 @@ if SERVER_ID == "s4":
 
 
 
-    @bot.message_handler(commands=['trial'])
-    def trial(message):
+    @bot.message_handler(commands=['tasks'])
+    def tasks(message):
         conn = get_db_connection()
         if not conn:
             send_temp_message(
@@ -2689,11 +2689,11 @@ if SERVER_ID == "s4":
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, user_id, url, chapter_range, status, server_id, crawler_version, created_at, completed_at
-                    FROM trial
+                    FROM tasks
                     ORDER BY created_at
                 """)
-                trial = cur.fetchall()
-                if not trial:
+                tasks = cur.fetchall()
+                if not tasks:
                     send_temp_message(
                         message.chat.id,
                         "ℹ️ Queue is empty.",
@@ -2701,9 +2701,9 @@ if SERVER_ID == "s4":
                     )
                     return
 
-                text = "📋 All trial in Table:\n\n"
+                text = "📋 All tasks in Table:\n\n"
 
-                for t in trial:
+                for t in tasks:
                     text += (
                         f"🆔 Task ID: {t['id']}\n"
                         f"👤 User ID: {t['user_id']}\n"
@@ -2755,7 +2755,7 @@ if SERVER_ID == "s4":
                 cur.execute("DELETE FROM user_retry_slots WHERE user_id=%s AND first_retry_at < NOW() - INTERVAL '24 hours';", (user_id,))
                 cur.execute("""
                     SELECT *
-                    FROM trial
+                    FROM tasks
                     WHERE user_id=%s
                       AND crawler_version='v4'
                       AND status='done'
@@ -2795,7 +2795,7 @@ if SERVER_ID == "s4":
                     cur.execute("INSERT INTO user_retry_slots (user_id, task_id) VALUES (%s, %s);", (user_id, task['id']))
 
                 cur.execute("""
-                    UPDATE trial
+                    UPDATE tasks
                     SET status='pending', completed_at=NULL, is_user_retry=TRUE,
                         retry_server_id=%s, retry_attempts=retry_attempts + 1
                     WHERE id=%s;
@@ -2871,7 +2871,7 @@ if SERVER_ID == "s4":
         if not conn:
             send_temp_message(chat_id, "❌ Database error.", user_id)
             return False
-        remaining_trial = None
+        remaining_tasks = None
         daily_task_limit = None
         try:
             with conn.cursor() as cur:
@@ -2889,7 +2889,7 @@ if SERVER_ID == "s4":
                     conn.rollback()
                     send_temp_message(
                         chat_id,
-                        "🚫 You cannot create download trial with this bot.",
+                        "🚫 You cannot create download tasks with this bot.",
                         user_id,
                     )
                     return False
@@ -2898,7 +2898,7 @@ if SERVER_ID == "s4":
                     daily_task_limit = control["daily_task_limit"]
                     cur.execute("""
                         SELECT COUNT(*) AS task_count
-                        FROM trial
+                        FROM tasks
                         WHERE user_id = %s
                             AND status IN ('pending', 'running', 'done')
                             AND created_at >= NOW() - INTERVAL '24 hours';
@@ -2915,8 +2915,8 @@ if SERVER_ID == "s4":
                             user_id,
                         )
                         return False
-                    remaining_trial = max(0, daily_task_limit - task_count - 1)
-                # Send WTR-Lab trial only to the separate local PC worker.
+                    remaining_tasks = max(0, daily_task_limit - task_count - 1)
+                # Send WTR-Lab tasks only to the separate local PC worker.
                 host = urllib.parse.urlparse(url).hostname or ""
                 if host.lower() in ("wtr-lab.com", "www.wtr-lab.com"):
 
@@ -2924,7 +2924,7 @@ if SERVER_ID == "s4":
                     total_chapters = 15
 
                 cur.execute("""
-                    INSERT INTO trial (
+                    INSERT INTO tasks (
                         user_id, chat_id, username, first_name, last_name,
                         url, chapter_range, crawler_version, novel_title,
                         total_chapters
@@ -2955,10 +2955,10 @@ if SERVER_ID == "s4":
             conn.close()
 
         limit_note = ""
-        if remaining_trial is not None:
+        if remaining_tasks is not None:
             limit_note = (
                 f"\n\n📊 Daily task limit: "
-                f"{remaining_trial}/{daily_task_limit} task(s) remaining "
+                f"{remaining_tasks}/{daily_task_limit} task(s) remaining "
                 f"within the next 24 hours."
             )
 
@@ -3340,12 +3340,12 @@ if SERVER_ID == "s4":
                         crawler_version,
                         created_at,
                         completed_at
-                    FROM trial
+                    FROM tasks
                     ORDER BY created_at
                 """)
-                trial = cur.fetchall()
+                tasks = cur.fetchall()
 
-                if not trial:
+                if not tasks:
                     send_temp_message(
                         message.chat.id,
                         "ℹ️ No task logs found.",
@@ -3355,7 +3355,7 @@ if SERVER_ID == "s4":
 
                 text = "📜 Task Logs (with user details):\n\n"
 
-                for t in trial:
+                for t in tasks:
                     username = f"@{t['username']}" if t['username'] else "N/A"
                     first = t['first_name'] or "N/A"
                     last = t['last_name'] or "N/A"
@@ -3429,7 +3429,7 @@ def mark_failed(task_id, keep_retryable=False):
                 if keep_retryable:
                     cur.execute(
                         """
-                        UPDATE trial
+                        UPDATE tasks
                         SET status='done', completed_at=NOW(), is_user_retry=FALSE
                         WHERE id=%s AND status!='cancelled'
                         """,
@@ -3438,7 +3438,7 @@ def mark_failed(task_id, keep_retryable=False):
                 else:
                     cur.execute(
                         """
-                        UPDATE trial
+                        UPDATE tasks
                         SET status='failed', completed_at=NOW()
                         WHERE id=%s AND status!='cancelled'
                         """,
@@ -3453,7 +3453,7 @@ def _touch_progress(task_id):
     if conn:
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE trial SET last_progress_at=NOW() WHERE id=%s", (task_id,))
+                cur.execute("UPDATE tasks SET last_progress_at=NOW() WHERE id=%s", (task_id,))
             conn.commit()
         except Exception:
             pass
@@ -3461,7 +3461,7 @@ def _touch_progress(task_id):
             conn.close()
 
 
-def process_trial_loop():
+def process_tasks_loop():
     while True:
         conn = None
         try:
@@ -3483,7 +3483,7 @@ def process_trial_loop():
                     # 1️⃣ s4 tries to pick a failed task from other servers first
                     cur.execute("""
                         SELECT *
-                        FROM trial
+                        FROM tasks
                         WHERE status='failed'
                           AND crawler_version= %s
                           AND NOT is_user_retry
@@ -3504,11 +3504,11 @@ def process_trial_loop():
                             f"🔗 URL: {task['url']}",
                             task['user_id']
                         )
-                # 2️⃣ If no failed trial (or not s2), pick a normal pending task
+                # 2️⃣ If no failed tasks (or not s2), pick a normal pending task
                 if not task:
                     cur.execute("""
                         SELECT t.*
-                        FROM trial AS t
+                        FROM tasks AS t
                         WHERE t.status = 'pending'
                           AND t.crawler_version = %s
                           AND (NOT t.is_user_retry OR t.retry_server_id = %s)
@@ -3518,10 +3518,10 @@ def process_trial_loop():
                             CASE
                                 WHEN (
                                     SELECT COUNT(*)
-                                    FROM trial AS user_trial
-                                    WHERE user_trial.user_id = t.user_id
-                                      AND user_trial.status IN ('done', 'running')
-                                      AND user_trial.created_at >= NOW() - INTERVAL '1 day'
+                                    FROM tasks AS user_tasks
+                                    WHERE user_tasks.user_id = t.user_id
+                                      AND user_tasks.status IN ('done', 'running')
+                                      AND user_tasks.created_at >= NOW() - INTERVAL '1 day'
                                 ) < 3
                                 THEN 0
                                 ELSE 1
@@ -3540,7 +3540,7 @@ def process_trial_loop():
 
                 # Mark task as running and assign this server
                 cur.execute(
-                    "UPDATE trial SET status='running', server_id=%s, run_id=%s WHERE id=%s",
+                    "UPDATE tasks SET status='running', server_id=%s, run_id=%s WHERE id=%s",
                     (SERVER_ID, RUN_ID, task['id'])
                 )
                 conn.commit()
@@ -3620,7 +3620,7 @@ def crawl_task(task):
             if conn:
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("SELECT status FROM trial WHERE id=%s", (task_id,))
+                        cur.execute("SELECT status FROM tasks WHERE id=%s", (task_id,))
                         row = cur.fetchone()
                         if row and row['status'] == 'cancelled':
                             cancel_event.set()
@@ -3824,7 +3824,7 @@ def crawl_task(task):
                     try:
                         with conn.cursor() as cur:
                             cur.execute("""
-                                UPDATE trial
+                                UPDATE tasks
                                 SET status='upload_failed', completed_at=NOW()
                                 WHERE id=%s AND status!='cancelled';
                             """, (task["id"],))
@@ -3863,7 +3863,7 @@ def crawl_task(task):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        UPDATE trial
+                        UPDATE tasks
                         SET status = CASE
                             WHEN status = 'upload_failed' THEN 'upload_failed'
                             ELSE 'done'
@@ -3910,7 +3910,7 @@ def crawl_task(task):
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE trial SET status='upload_failed', completed_at=NOW() WHERE id=%s AND status!='cancelled'",
+                        "UPDATE tasks SET status='upload_failed', completed_at=NOW() WHERE id=%s AND status!='cancelled'",
                         (task['id'],)
                     )
                 conn.commit()
@@ -3935,7 +3935,7 @@ def cleanup_expired_retry_cache():
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT id, url, cache_novel_id
-                FROM trial
+                FROM tasks
                 WHERE crawler_version='v4'
                   AND server_id=%s
                   AND status='done'
@@ -3950,7 +3950,7 @@ def cleanup_expired_retry_cache():
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT 1
-                    FROM trial
+                    FROM tasks
                     WHERE server_id=%s
                       AND rtrim(url, '/')=rtrim(%s, '/')
                       AND id != %s
@@ -3976,7 +3976,7 @@ def cleanup_expired_retry_cache():
 
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE trial SET cache_novel_id=NULL WHERE id=%s AND cache_novel_id=%s",
+                        "UPDATE tasks SET cache_novel_id=NULL WHERE id=%s AND cache_novel_id=%s",
                         (task['id'], task['cache_novel_id']),
                     )
                 conn.commit()
@@ -4033,8 +4033,8 @@ def cleanup_loop():
             cleanup_lightnovels_folder()
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
-threading.Thread(target=process_trial_loop, daemon=True).start()
-def reap_orphaned_trial():
+threading.Thread(target=process_tasks_loop, daemon=True).start()
+def reap_orphaned_tasks():
     while True:
         conn = get_db_connection()
         if conn:
@@ -4042,7 +4042,7 @@ def reap_orphaned_trial():
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("""
                         SELECT t.id, t.chat_id, t.user_id
-                        FROM trial t
+                        FROM tasks t
                         LEFT JOIN servers s ON s.server_id = t.server_id
                         WHERE t.status = 'running'
                           AND (t.last_progress_at IS NULL OR t.last_progress_at < NOW() - INTERVAL '45 seconds')
@@ -4056,7 +4056,7 @@ def reap_orphaned_trial():
                     orphaned = cur.fetchall()
                     for t in orphaned:
                         cur.execute(
-                            "UPDATE trial SET status='failed', server_id=NULL, completed_at=NOW() WHERE id=%s",
+                            "UPDATE tasks SET status='failed', server_id=NULL, completed_at=NOW() WHERE id=%s",
                             (t['id'],)
                         )
                         try:
@@ -4074,7 +4074,7 @@ def reap_orphaned_trial():
                 conn.close()
         time.sleep(30)
 
-threading.Thread(target=reap_orphaned_trial, daemon=True).start()
+threading.Thread(target=reap_orphaned_tasks, daemon=True).start()
 
 
 
@@ -4148,7 +4148,7 @@ def check_dead_servers(timeout_seconds=15):
         time.sleep(1800) #determines how often Telegram notifications are sent for dead servers.
 threading.Thread(target=check_dead_servers, daemon=True).start()
 
-def cleanup_old_trial():
+def cleanup_old_tasks():
     while True:
         conn = get_db_connection()
         if conn:
@@ -4157,7 +4157,7 @@ def cleanup_old_trial():
                     # Keep retry-eligible tasks until their 20-hour retry window and
                     # 24-hour local-cache retention period have both elapsed.
                     cur.execute("""
-                        DELETE FROM trial
+                        DELETE FROM tasks
                         WHERE created_at IS NOT NULL
                           AND created_at < NOW() - INTERVAL '1 day'
                           AND (
@@ -4167,7 +4167,7 @@ def cleanup_old_trial():
                     """)
                     conn.commit()
             except Exception as e:
-                print(f"[CLEANUP trial ERROR] {e}")
+                print(f"[CLEANUP tasks ERROR] {e}")
             finally:
                 conn.close()
         time.sleep(60 * 60)  # run every hour
@@ -4242,7 +4242,7 @@ def process_pending_upload_retries():
                     """, (upload["id"],))
 
                     cur.execute("""
-                        UPDATE trial
+                        UPDATE tasks
                         SET status='done', completed_at=NOW()
                         WHERE id=%s AND status='upload_failed';
                     """, (upload["task_id"],))
@@ -4329,15 +4329,15 @@ def cleanup_expired_pending_uploads():
 
         time.sleep(60 * 60)
 
-threading.Thread(target=cleanup_old_trial, daemon=True).start()
+threading.Thread(target=cleanup_old_tasks, daemon=True).start()
 threading.Thread(target=process_pending_upload_retries, daemon=True).start()
 threading.Thread(target=cleanup_expired_pending_uploads, daemon=True).start()
 threading.Thread(target=retry_cache_cleanup_loop, daemon=True).start()
 
 
 # ---------------------- RUN BOT ----------------------
-if SERVER_ID == "s4":
-    print("[MODE] s4 – polling enabled")
+if SERVER_ID == "s1":
+    print("[MODE] s1 – polling enabled")
     bot.infinity_polling()
 
 else:
