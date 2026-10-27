@@ -2,6 +2,7 @@
 import logging
 import re
 from typing import Iterable, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate, Volume
 
@@ -32,14 +33,30 @@ class NovelPhoenixCrawler(SoupTemplate):
             soup = self.scraper.get_soup(url)
             yield from soup.select("ul.chapter-list li a[href]")
 
-            links = soup.select("a.page-link[href*='chapters?page=']")
-            next_link = next(
-                (link for link in links if link.get_text(" ", strip=True) in {"?", ">", "Next"}),
-                None,
-            )
-            if not next_link:
+            # The site does not consistently mark the next button with rel="next".
+            # Instead, follow the smallest pagination number greater than the page
+            # currently being fetched. This works even when the arrow text is hidden.
+            current_page = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
+            candidates = []
+            page_controls = list(soup.select("a[href*='chapters?page=']"))
+            page_controls.extend(soup.select("option[value*='chapters?page=']"))
+            for link in page_controls:
+                href = link.get("href") or link.get("value")
+                if not href:
+                    continue
+                page_values = parse_qs(urlsplit(href).query).get("page", [])
+                if not page_values:
+                    continue
+                try:
+                    page_number = int(page_values[0])
+                except ValueError:
+                    continue
+                if page_number > current_page:
+                    candidates.append((page_number, href.split("#", 1)[0]))
+
+            if not candidates:
                 break
-            url = self.absolute_url(next_link.get("href"))
+            url = self.absolute_url(min(candidates)[1])
 
     def parse_chapter_title(self, soup: PageSoup, chapter: Chapter) -> None:
         # A row runs number, title and timestamp together with no separators between the

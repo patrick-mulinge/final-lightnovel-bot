@@ -1,105 +1,87 @@
-# -*- coding: utf-8 -*-
-import logging
-import re
-from typing import Iterable, Optional
+﻿# -*- coding: utf-8 -*-
+"""Crawler for Scribble Hub series pages."""
 
-from lncrawl.core import Novel, PageSoup, SoupTemplate, Volume
+import logging
+import math
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 logger = logging.getLogger(__name__)
 
-digit_regex = re.compile(r"\?toc=(\d+)#content1$")
 
+class ScribbleHubCrawler(LegacyCrawler):
+    base_url = [
+        "https://www.scribblehub.com/",
+    ]
 
-class ScribbleHubCrawler(SoupTemplate):
-    base_url = "https://www.scribblehub.com/"
-    has_manga = False
-    has_mtl = False
+    def _page_url(self, page):
+        parsed = urlparse(self.novel_url)
+        query = parse_qs(parsed.query)
+        query["toc"] = [str(page)]
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
-    novel_url_selector = ".fictionposts-template-default"
-    novel_title_selector = ".fic_title"
-    novel_cover_selector = ".fic_image img"
-    novel_author_selector = ".auth_name_fic"
-    novel_tags_selector = "a.fic_genre"
-    novel_synopsis_selector = ".wi_fic_desc"
+    def read_novel_info(self):
+        soup = self.get_soup(self.novel_url)
 
-    chapter_list_selector = ".toc_ol a.toc_a"
-    chapter_body_selector = "#chp_raw"
+        title = soup.select_one('.fic_title[property="name"], .fic_title')
+        if not title:
+            raise RuntimeError("No novel title found")
+        self.novel_title = title.get_text(" ", strip=True)
 
-    def initialize(self) -> None:
-        self.cleaner.bad_css.update(
-            [
-                ".p-avatar-wrap",
-                ".sp-head",
-                ".spdiv",
-                ".chp_stats_feature",
-                ".modern-footnotes-footnote",
-                ".modern-footnotes-footnote__note",
-                ".wi_authornotes",
-            ]
-        )
-        self.cleaner.whitelist_attributes.update(
-            [
-                "border",
-                "class",
-            ]
-        )
-        self.cleaner.whitelist_css_property.update(
-            [
-                "text-align",
-            ]
-        )
+        author = soup.select_one('.author_bg a, .fic_author a, .auth_name_fic')
+        if author:
+            self.novel_author = author.get_text(" ", strip=True)
 
-    # def visit_novel_page_in_browser(self) -> PageSoup:
-    #     url_parts = self.novel_url.split("/")
-    #     self.novel_url = f"{url_parts[0]}/{url_parts[2]}/{url_parts[3]}/{url_parts[4]}/"
-    #     logger.debug(self.novel_url)
-    #     self.visit(self.novel_url)
-    #     self.browser.wait(".fictionposts-template-default")
+        synopsis = soup.select_one('.wi_fic_desc[property="description"]')
+        if synopsis:
+            self.novel_synopsis = self.cleaner.extract_contents(synopsis)
 
-    def select_chapter_tags(
-        self,
-        tag: PageSoup,
-        novel: Novel,
-        volume: Optional[Volume] = None,
-    ) -> Iterable[PageSoup]:
-        chapter_count = -1
-        chapter_count_tag = tag.select_one("span.cnt_toc")
-        if chapter_count_tag.text.isdigit():
-            chapter_count = int(chapter_count_tag.text)
-        novel.chapter_count = chapter_count
+        cover = soup.select_one('.fic_image img[property="image"], .fic_image img')
+        if cover and cover.get("src"):
+            self.novel_cover = self.absolute_url(cover["src"])
 
-        mypostid_tag = tag.select_one("input#mypostid[value]")
-        mypostid = int(str(mypostid_tag["value"]))
-        novel.mypostid = mypostid
+        count_tag = soup.select_one("#chpcounter, .cnt_toc")
+        try:
+            total = int(count_tag.get("value") or count_tag.get_text(strip=True))
+        except (AttributeError, TypeError, ValueError):
+            total = 15
+        pages = max(1, math.ceil(total / 15))
 
-        response = self.scraper.submit_form(
-            f"{self.scraper.origin}wp-admin/admin-ajax.php",
-            {
-                "action": "wi_getreleases_pagination",
-                "pagenum": -1,
-                "mypostid": mypostid,
-            },
-        )
-        tag = self.scraper.make_soup(response)
-        return reversed(tag.select(self.chapter_list_selector))
+        volume = Volume(id=1, title="")
+        self.volumes.append(volume)
+        chapter_items = []
+        seen = set()
+        for page in range(1, pages + 1):
+            page_soup = soup if page == 1 else self.get_soup(self._page_url(page))
+            for link in page_soup.select(".toc_ol a.toc_a[href]"):
+                href = link.get("href")
+                if not href or href in seen:
+                    continue
+                seen.add(href)
+                chapter_items.append(
+                    (link.get_text(" ", strip=True), self.absolute_url(href))
+                )
 
-    # def parse_chapter_list_in_browser(
-    #     self,
-    # ) -> Generator[Union[Chapter, Volume], None, None]:
-    #     _pages = max(
-    #         [
-    #             int(digit_regex.search(a["href"]).group(1))
-    #             for a in self.browser.soup.select(".simple-pagination a")
-    #             if digit_regex.search(a["href"]) is not None
-    #         ]
-    #     )
-    #     if not _pages:
-    #         _pages = 1
-    #     tags = self.browser.soup.select(".main .toc li a")
-    #     for i in range(2, _pages + 1):
-    #         self.browser.visit(urljoin(self.novel_url, f"?toc={i}#content1"))
-    #         self.browser.wait(".main")
-    #         tags += self.browser.soup.select(".main .toc li a")
+        # ScribbleHub lists newest chapters first. Assign IDs after reversing
+        # so the EPUB is ordered from the oldest chapter to the newest.
+        for chapter_id, (title_text, chapter_url) in enumerate(
+            reversed(chapter_items), start=1
+        ):
+            self.chapters.append(
+                Chapter(
+                    id=chapter_id,
+                    volume=volume.id,
+                    title=title_text,
+                    url=chapter_url,
+                )
+            )
+    def download_chapter_body(self, chapter):
+        soup = self.get_soup(chapter["url"])
+        content = soup.select_one("#chp_raw")
+        if not content:
+            return ""
+        for node in content.select("script, style, img"):
+            node.decompose()
+        return self.cleaner.extract_contents(content)
 
-    #     for _id, _t in enumerate(reversed(tags)):
-    #         yield Chapter(id=_id, url=self.absolute_url(_t.get("href")), title=_t.text.strip())

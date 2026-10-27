@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import re
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
@@ -18,23 +18,44 @@ class NovelFireCrawler(LegacyCrawler):
     request_rate_limit = 3
 
     def _chapter_url(self, href: str) -> str:
-        """Normalize NovelFire's escaped external mirror links."""
+        """Build a canonical NovelPhoenix URL from an escaped mirror link."""
         from urllib.parse import unquote
 
         value = unquote(href or "").replace("\\", "")
-        match = re.search(r"(?:https?://)?(novelphoenix\.com/novel/[^?#]+)", value)
+        match = re.search(
+            r"novelphoenix\.com/novel/([^/?#]+)/chapter-(\d+)",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            match = re.search(
+                r"(?:https?://(?:www\.)?novelfire\.net)?/book/([^/?#]+)/chapter-(\d+)",
+                value,
+                re.IGNORECASE,
+            )
         if match:
-            return "https://" + match.group(1).rstrip("/")
+            slug, number = match.groups()
+            return f"https://novelphoenix.com/novel/{slug}/chapter-{number}"
         return self.absolute_url(value)
 
     def read_novel_info(self) -> None:
         soup = self.get_soup(self.novel_url)
 
-        self.novel_title = soup.find("h1").text.strip()
-        self.novel_author = soup.select_one('span[itemprop="author"]').text.strip()
+        title = soup.find("h1")
+        author = soup.select_one('span[itemprop="author"]')
+        if not title:
+            raise RuntimeError("NovelFire novel title was not found")
+
+        self.novel_title = title.get_text(" ", strip=True)
+        self.novel_author = author.get_text(" ", strip=True) if author else ""
+
+        synopsis = soup.select_one("div.summary .content")
+        if synopsis:
+            self.novel_synopsis = synopsis.get_text(" ", strip=True)
 
         img = soup.select_one(".cover img")
-        self.novel_cover = self.absolute_url(img["src"])
+        if img and img.get("src"):
+            self.novel_cover = self.absolute_url(img["src"])
 
         vol_id = 1
         vol_url = self.novel_url + "/chapters"
@@ -42,21 +63,21 @@ class NovelFireCrawler(LegacyCrawler):
         while vol_url:
             soup = self.get_soup(self.absolute_url(vol_url))
 
-            chapters = soup.select("ul.chapter-list li a")
+            chapters = soup.select("ul.chapter-list li a[href]")
             for a in chapters:
                 chap_id = len(self.chapters) + 1
                 self.chapters.append(
                     Chapter(
                         id=chap_id,
                         volume=vol_id,
-                        title=a["title"],
+                        title=a.get("title") or a.get_text(" ", strip=True),
                         url=self._chapter_url(a["href"]),
                     )
                 )
 
             self.volumes.append(Volume(id=vol_id))
 
-            next_vol_a = soup.select_one("a.page-link[rel='next']")
+            next_vol_a = soup.select_one("a.page-link[rel='next'][href]")
             if next_vol_a:
                 vol_url = next_vol_a["href"]
                 vol_id += 1
@@ -66,7 +87,9 @@ class NovelFireCrawler(LegacyCrawler):
 
     def download_chapter_body(self, chapter) -> str:
         soup = self.get_soup(chapter["url"])
-        contents = soup.select_one("div#content")
+        contents = soup.select_one(
+            "div#content, div.chapter-content, div.content, div.cha-content, .cha-words"
+        )
         if not contents:
             return ""
 
@@ -80,7 +103,7 @@ class NovelFireCrawler(LegacyCrawler):
                 continue
 
             # 2. checking for ANY title layout starting with "Chapter X"
-            # This matches "Chapter 1:", "Chapter 1 –", "Chapter 1: Chapter 1:" etc.
+            # This matches "Chapter 1:", "Chapter 1 â€“", "Chapter 1: Chapter 1:" etc.
             if re.match(r"(?i)^\s*chapter\s+\d+", element_text):
                 element.decompose()
 
@@ -108,3 +131,6 @@ class NovelFireCrawler(LegacyCrawler):
             )
 
         return results
+
+
+
