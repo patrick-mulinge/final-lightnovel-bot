@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import logging
 import re
 
@@ -25,7 +25,7 @@ class RoyalRoadCrawler(LegacyCrawler):
         return results
 
     def read_novel_info(self):
-        soup = self.get_soup(self.novel_url)
+        soup = self.render_soup(self.novel_url, wait_for=".fic-header h1", timeout=90)
 
         self.novel_title = soup.select_one(".fic-header h1").text.strip()
         logger.info("Novel title: %s", self.novel_title)
@@ -61,7 +61,7 @@ class RoyalRoadCrawler(LegacyCrawler):
             )
 
     def download_chapter_body(self, chapter):
-        soup = self.get_soup(chapter["url"])
+        soup = self.render_soup(chapter["url"], wait_for=".chapter-content", timeout=90)
 
         possible_title = soup.select_one("h2")
         if possible_title and "Chapter" in possible_title.text:
@@ -82,3 +82,5 @@ class RoyalRoadCrawler(LegacyCrawler):
 
         self.cleaner.clean_contents(contents)
         return str(contents)
+
+
