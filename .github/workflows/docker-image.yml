@@ -35,6 +35,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: patiorjunrick/final-lightnovel-bot:v38.2
+          tags: patiorjunrick/final-lightnovel-bot:v39.2
           cache-from: type=gha
           cache-to: type=gha,mode=max
