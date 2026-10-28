@@ -3439,7 +3439,7 @@ def mark_failed(task_id, keep_retryable=False):
                     cur.execute(
                         """
                         UPDATE tasks
-                        SET status='failed', completed_at=NOW()
+                        SET status='failed', completed_at=NOW(), retry_count = retry_count + 1
                         WHERE id=%s AND status!='cancelled'
                         """,
                         (task_id,),
@@ -3485,6 +3485,7 @@ def process_tasks_loop():
                         SELECT *
                         FROM tasks
                         WHERE status='failed'
+                          AND retry_count < 2
                           AND crawler_version= %s
                           AND NOT is_user_retry
                           AND (server_id IS NULL OR server_id != %s)
@@ -4056,7 +4057,7 @@ def reap_orphaned_tasks():
                     orphaned = cur.fetchall()
                     for t in orphaned:
                         cur.execute(
-                            "UPDATE tasks SET status='failed', server_id=NULL, completed_at=NOW() WHERE id=%s",
+                            "UPDATE tasks SET status='failed', server_id=NULL, completed_at=NOW(), retry_count = retry_count + 1 WHERE id=%s",
                             (t['id'],)
                         )
                         try:
