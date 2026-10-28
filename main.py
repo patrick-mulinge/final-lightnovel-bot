@@ -135,6 +135,15 @@ def setup_tasks_table():
                 );
             """)
 
+            cur.execute("""
+                ALTER TABLE tasks
+                ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0
+            """)
+            cur.execute("""
+                UPDATE tasks
+                SET retry_count = 0
+                WHERE retry_count IS NULL
+            """)
             cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS username TEXT;")
             cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS first_name TEXT;")
             cur.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_name TEXT;")
