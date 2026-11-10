@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Crawler for NovelCEO novel and chapter pages."""
 
 import re
@@ -23,40 +23,37 @@ class NovelCeoCrawler(LegacyCrawler):
             self.novel_cover = urljoin(self.scraper.origin, cover["content"])
 
         self.volumes.append(Volume(id=1, title="Volume 1"))
-        novel_id = ""
-        rating = soup.select_one("[data-novel-id]")
-        if rating:
-            novel_id = rating.get("data-novel-id", "").strip()
-
-        chapter_soups = [soup]
-        if novel_id:
-            archive_url = urljoin(
-                self.scraper.origin,
-                f"/ajax/chapter-archive?novelId={novel_id}&crawler_access=1",
+        visible = {}
+        for link in soup.select("a[href*='/chapter-']"):
+            href = link.get("href", "")
+            match = re.search(r"chapter-(\d+)", href, re.IGNORECASE)
+            if not match:
+                continue
+            number = int(match.group(1))
+            visible[number] = (
+                link.get_text(" ", strip=True) or f"Chapter {number}",
+                urljoin(self.scraper.origin, href),
             )
-            chapter_soups.append(self.get_soup(archive_url))
 
-        seen_numbers = set()
-        for chapter_soup in chapter_soups:
-            for link in chapter_soup.select("a[href*='/chapter-']"):
-                href = link.get("href", "")
-                match = re.search(r"(?:chapter[-/]|/)(\d+)(?:[/?#]|$)", href)
-                if not match:
-                    match = re.search(r"Chapter\\s+(\\d+)", link.get_text(" ", strip=True), re.IGNORECASE)
-                if not match:
-                    continue
-                number = int(match.group(1))
-                if number in seen_numbers:
-                    continue
-                seen_numbers.add(number)
-                self.chapters.append(
-                    Chapter(
-                        id=number,
-                        volume=1,
-                        title=f"Chapter {number}",
-                        url=urljoin(self.scraper.origin, href),
-                    )
+        latest = soup.select_one("meta[property='og:novel:lastest_chapter_url']")
+        latest_url = latest.get("content", "") if latest else ""
+        latest_match = re.search(r"chapter-(\d+)", latest_url, re.IGNORECASE)
+        total = int(latest_match.group(1)) if latest_match else max(visible, default=0)
+        novel_base = self.novel_url.rstrip("/")
+
+        for number in range(1, total + 1):
+            title, url = visible.get(
+                number,
+                (f"Chapter {number}", f"{novel_base}/chapter-{number}"),
+            )
+            self.chapters.append(
+                Chapter(
+                    id=number,
+                    volume=1,
+                    title=title,
+                    url=url,
                 )
+            )
         self.chapters.sort(key=lambda chapter: chapter.id)
         if not self.chapters:
             raise RuntimeError("NovelCEO chapter catalogue was empty")
