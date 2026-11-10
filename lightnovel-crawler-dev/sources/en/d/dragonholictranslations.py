@@ -69,6 +69,8 @@ class DragonholicTranslationsCrawler(LegacyCrawler):
 
         self.volumes.append(Volume(id=1, title="Volume 1"))
         for item in chapters:
+            if item.get("is_premium"):
+                continue
             number = int(item.get("chapter_order") or len(self.chapters) + 1)
             slug = item.get("slug") or f"chapter-{number}"
             title = item.get("name") or f"Chapter {number}"
@@ -80,7 +82,7 @@ class DragonholicTranslationsCrawler(LegacyCrawler):
                     id=number,
                     volume=1,
                     title=title,
-                    url=urljoin(self.novel_url, f"{slug}/"),
+                    url=urljoin(self.novel_url.rstrip("/") + "/", f"{slug}/"),
                 )
             )
         self.chapters.sort(key=lambda chapter: chapter.id)
