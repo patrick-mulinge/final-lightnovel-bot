@@ -444,9 +444,6 @@ last_bot_messages = {}  # user_id -> list of final messages
 pending_urls = {}
 pending_retry_urls = {}  # user_id -> chat_id; the next message must be the completed task URL
 pending_cancel_tasks = {}  # user_id -> ordered list of cancelable tasks, expires after 10 minutes
-# URL (normalized) -> {title, total_chapters} from background scans that finished
-# before the user entered a range (skip-scan race).
-pending_scan_titles = {}
 
 pending_range_state = {}  # user_id -> {token, chat_id, url, version, title, total_chapters, user_id, username, first_name, last_name}
 
@@ -837,6 +834,7 @@ def _crawl_v4_with_progress_impl(
     on_image_progress=None,
     on_total_known=None,
     resume_missing=False,
+    on_novel_id=None,
 ):
     """Download the selected v4 chapters once, then fetch images and create the EPUB."""
     
@@ -848,6 +846,13 @@ def _crawl_v4_with_progress_impl(
 
 
     novel = ctx.crawler.fetch_novel(user.id, url, custom=crawler)
+
+    # Report the cache id immediately so a hard stop / crash can still record it.
+    if on_novel_id:
+        try:
+            on_novel_id(str(novel.id))
+        except Exception as e:
+            print(f"[ON_NOVEL_ID] {e}")
 
     # The cover has already been discovered. Ignore only chapter illustrations.
     if should_ignore_chapter_images(url):
@@ -1032,6 +1037,7 @@ def crawl_v4_with_progress(
     on_image_progress=None,
     on_total_known=None,
     resume_missing=False,
+    on_novel_id=None,
 ):
     """Run v4 while restoring its global image setting after this task."""
     ctx, _ = _v4()
@@ -1045,6 +1051,7 @@ def crawl_v4_with_progress(
             on_image_progress=on_image_progress,
             on_total_known=on_total_known,
             resume_missing=resume_missing,
+            on_novel_id=on_novel_id,
         )
     finally:
         ctx.config.crawler.ignore_images = previous_ignore_images
@@ -1395,15 +1402,6 @@ def process_preview_loop():
                           AND (novel_title IS NULL OR novel_title = '' OR total_chapters IS NULL)
                     """, (novel.title, novel.chapter_count, req['url']))
                     conn.commit()
-                # Also stash for skip-scan race: scan finished before any task row exists.
-                try:
-                    key = (req['url'] or "").rstrip("/").lower()
-                    pending_scan_titles[key] = {
-                        "title": novel.title,
-                        "total_chapters": novel.chapter_count,
-                    }
-                except Exception:
-                    pass
                 print(
                     f"[PREVIEW DONE] pid={req['id']} title={novel.title!r} "
                     f"chapters={novel.chapter_count} url={req['url']}"
@@ -3175,12 +3173,14 @@ if SERVER_ID == "s1":
                             SELECT title, chapter_count
                             FROM preview_requests
                             WHERE rtrim(url, '/') = rtrim(%s, '/')
+                              AND user_id = %s
                               AND status = 'done'
                               AND title IS NOT NULL
+                              AND created_at >= NOW() - INTERVAL '2 hours'
                             ORDER BY id DESC
                             LIMIT 1
                             """,
-                            (url,),
+                            (url, user_id),
                         )
                         prev = cur.fetchone()
                         if prev:
@@ -3761,8 +3761,33 @@ def _touch_progress(task_id, snapshot=None):
         conn.close()
 
 
-def process_tasks_loop():
+_task_loop_lock = threading.Lock()
+_task_loop_generation = 0
+
+
+def _start_task_loop():
+    """
+    Start a worker loop thread and retire any earlier one. An old loop thread
+    that is stuck inside crawl_task() exits by itself if that call ever returns.
+    """
+    global _task_loop_generation
+    with _task_loop_lock:
+        _task_loop_generation += 1
+        generation = _task_loop_generation
+    threading.Thread(
+        target=process_tasks_loop,
+        args=(generation,),
+        daemon=True,
+        name=f"task-loop-{generation}",
+    ).start()
+    return generation
+
+
+def process_tasks_loop(generation):
     while True:
+        if generation != _task_loop_generation:
+            print(f"[WORKER LOOP] generation {generation} retired (replaced by {_task_loop_generation})")
+            return
         conn = None
         try:
             conn = get_db_connection()
@@ -3821,7 +3846,7 @@ def process_tasks_loop():
                                     SELECT COUNT(*)
                                     FROM tasks AS user_tasks
                                     WHERE user_tasks.user_id = t.user_id
-                                      AND user_tasks.status IN ('done', 'running')
+                                      AND user_tasks.status IN ('done', 'running', 'upload_failed')
                                       AND user_tasks.created_at >= NOW() - INTERVAL '1 day'
                                 ) < 2
                                 THEN 0
@@ -3908,7 +3933,7 @@ def crawl_task(task):
         f"url={url} crawler={task.get('crawler_version')}"
     )
 
-    temp_folder = os.path.join("./novels", f"{user_id}_{task_id}")
+    temp_folder = os.path.join("./novels", f"{user_id}_{task_id}_{uuid.uuid4().hex[:8]}")
     os.makedirs(temp_folder, exist_ok=True)
 
     # ⚠️ wtr-lab warning (non-blocking)
@@ -3961,6 +3986,26 @@ def crawl_task(task):
                 conn.close()
         except Exception as e:
             print(f"[ON_TOTAL_KNOWN] task={task_id}: {e}")
+
+    novel_id_holder = {"id": None}
+
+    def on_novel_id(nid):
+        """Remember the lncrawl cache id and persist it right away."""
+        novel_id_holder["id"] = nid
+        conn = get_db_connection()
+        if not conn:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE tasks SET cache_novel_id=%s WHERE id=%s AND status!='cancelled'",
+                    (nid, task_id),
+                )
+            conn.commit()
+        except Exception as e:
+            print(f"[CACHE ID SAVE ERROR] task={task_id}: {e}")
+        finally:
+            conn.close()
 
     # Decide whether this user gets live progress or a static notice
     user_running = _count_user_running_tasks(user_id)
@@ -4155,6 +4200,7 @@ def crawl_task(task):
                 on_image_progress=on_image_progress,
                 on_total_known=on_total_known,
                 resume_missing=bool(task.get("is_user_retry")),
+                on_novel_id=on_novel_id,
             )
         else:
             epub_path, actual_total_chapters, novel_title, novel_synopsis, cover_source = crawl_v3_with_progress(
@@ -4166,8 +4212,9 @@ def crawl_task(task):
         import traceback
         stop_watcher.set()
         with running_lock:
-            running_processes.pop(task_id, None)
-            progress_snapshots.pop(task_id, None)
+            if running_processes.get(task_id) is cancel_event:
+                running_processes.pop(task_id, None)
+                progress_snapshots.pop(task_id, None)
 
         if progress_msg is not None:
             cleanup_bot_message(user_id, chat_id, progress_msg.message_id)
@@ -4176,7 +4223,42 @@ def crawl_task(task):
             # Hard wall-clock limit: keep v4 chapter cache, mark failed with a
             # retryable error so /retry (anyone) can resume from saved chapters.
             if hard_limit_hit.get("flag"):
-                # Treat like a partial/missing-chapters completion so /retry
+                # /retry only exists for v4 (v3 keeps no resumable cache).
+                if task["crawler_version"] != "v4":
+                    conn = get_db_connection()
+                    if conn:
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    """
+                                    UPDATE tasks
+                                    SET status='failed', completed_at=NOW(), error=%s,
+                                        retry_count=GREATEST(retry_count, 2)
+                                    WHERE id=%s AND status!='cancelled'
+                                    """,
+                                    (f"Hard limit of {HARD_TASK_LIMIT_HOURS}h reached", task_id),
+                                )
+                            conn.commit()
+                        finally:
+                            conn.close()
+                    try:
+                        send_task_message_24h(
+                            chat_id,
+                            (
+                                f"⏰ Task {task_id} hit the {HARD_TASK_LIMIT_HOURS}-hour "
+                                "download limit and was stopped.\n\n"
+                                f"🔗 {url}\n\n"
+                                "This crawler version cannot resume a stopped download. "
+                                "Send /download to start it again, ideally with a smaller chapter range."
+                            ),
+                            user_id,
+                        )
+                    except Exception as notify_err:
+                        print(f"[HARD LIMIT NOTIFY] {notify_err}")
+                    shutil.rmtree(temp_folder, ignore_errors=True)
+                    return
+
+                # v4: treat like a partial/missing-chapters completion so /retry
                 # pins to this same server (chapter cache lives here).
                 conn = get_db_connection()
                 if conn:
@@ -4189,6 +4271,8 @@ def crawl_task(task):
                                     completed_at=NOW(),
                                     error=%s,
                                     server_id=%s,
+                                    is_user_retry=FALSE,
+                                    cache_novel_id=COALESCE(%s, cache_novel_id),
                                     retry_expires_at=COALESCE(
                                         retry_expires_at,
                                         NOW() + (%s * INTERVAL '1 hour')
@@ -4200,6 +4284,7 @@ def crawl_task(task):
                                     f"Hard limit of {HARD_TASK_LIMIT_HOURS}h reached; "
                                     "chapters already downloaded are kept for /retry",
                                     SERVER_ID,
+                                    novel_id_holder["id"],
                                     USER_RETRY_WINDOW_HOURS,
                                     task_id,
                                 ),
@@ -4208,7 +4293,7 @@ def crawl_task(task):
                     finally:
                         conn.close()
                 try:
-                    send_task_message_24h(
+                    hard_msg = send_task_message_24h(
                         chat_id,
                         (
                             f"⏰ Task {task_id} hit the {HARD_TASK_LIMIT_HOURS}-hour "
@@ -4225,6 +4310,13 @@ def crawl_task(task):
                         user_id,
                         is_final=True,
                     )
+                    if hard_msg:
+                        # Keep it for the whole retry window, then remove it.
+                        threading.Thread(
+                            target=delete_message_later,
+                            args=(chat_id, hard_msg.message_id, USER_RETRY_WINDOW_HOURS * 3600),
+                            daemon=True,
+                        ).start()
                 except Exception as notify_err:
                     print(f"[HARD LIMIT NOTIFY] {notify_err}")
                 # Do NOT wipe lncrawl novel cache; only the task temp folder.
@@ -4503,8 +4595,9 @@ def crawl_task(task):
 
     finally:
         with running_lock:
-            running_processes.pop(task_id, None)
-            progress_snapshots.pop(task_id, None)
+            if running_processes.get(task_id) is cancel_event:
+                running_processes.pop(task_id, None)
+                progress_snapshots.pop(task_id, None)
         print(
             f"[CRAWL END] server={SERVER_ID} task={task_id} "
             f"user={user_id} title={title_holder.get('title')!r} url={url}"
@@ -4566,7 +4659,7 @@ def cleanup_expired_retry_cache():
                 FROM tasks
                 WHERE crawler_version='v4'
                   AND server_id=%s
-                  AND status='done'
+                  AND status IN ('done', 'upload_failed')
                   AND retry_expires_at < NOW() - INTERVAL '4 hours'
                   AND cache_novel_id IS NOT NULL
                 ORDER BY retry_expires_at ASC
@@ -4661,7 +4754,7 @@ def cleanup_loop():
             cleanup_lightnovels_folder()
 
 threading.Thread(target=cleanup_loop, daemon=True).start()
-threading.Thread(target=process_tasks_loop, daemon=True).start()
+_start_task_loop()
 def reap_orphaned_tasks():
     """
     Two cases:
@@ -4726,6 +4819,8 @@ def reap_orphaned_tasks():
                                             run_id=NULL,
                                             completed_at=NULL,
                                             last_progress_at=NULL,
+                                            is_user_retry=FALSE,
+                                            retry_server_id=NULL,
                                             retry_count = retry_count + 1
                                         WHERE id=%s AND status='running'
                                         """,
@@ -4734,6 +4829,11 @@ def reap_orphaned_tasks():
                                 conn.commit()
                             except Exception as e:
                                 print(f"[REAPER LOCAL REQUEUE ERROR] {e}")
+                            # The loop thread that ran this crawl may be hung inside
+                            # crawl_task(). Start a replacement so this worker keeps
+                            # claiming other tasks; the old one retires if it returns.
+                            new_gen = _start_task_loop()
+                            print(f"[REAPER LOCAL] replacement worker loop started (generation {new_gen})")
                             try:
                                 send_task_message(
                                     row["chat_id"],
