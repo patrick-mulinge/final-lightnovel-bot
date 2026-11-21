@@ -4478,35 +4478,48 @@ def crawl_task(task):
                 delay,
             )
 
-        # User send failed (upload_failed): groups still get the EPUB via
-        # direct upload (not copy_message), plus the external-link notice
-        # that upload_external_fallback already sends to FALLBACK_LINK_GROUPS.
+        # If the user upload fails, send the complete package directly to
+        # every configured group. Do not depend on forwarding messages from
+        # the user's chat because that chat may be the failing destination.
         if direct_group_epubs:
             def _direct_group_upload():
                 for group_id in groups:
-                    for fpath, fcap in direct_group_epubs:
-                        try:
+                    try:
+                        group_cover = send_cover_post(
+                            group_id,
+                            cover_source,
+                            display_title,
+                            url,
+                            task["crawler_version"],
+                        )
+                        if not group_cover:
+                            print(f"[GROUP COVER FAILED] task={task['id']} group={group_id}")
+
+                        for synopsis_message in build_synopsis_messages(novel_synopsis):
+                            if not send_message_with_retry(
+                                group_id,
+                                synopsis_message,
+                                parse_mode="HTML",
+                                max_retries=1,
+                            ):
+                                print(f"[GROUP SYNOPSIS FAILED] task={task['id']} group={group_id}")
+
+                        for fpath, fcap in direct_group_epubs:
                             sent = send_document_with_retry(
                                 chat_id=group_id,
                                 file_path=fpath,
                                 caption=fcap,
                                 max_retries=1,
                             )
-                            if sent:
-                                print(
-                                    f"[GROUP DIRECT EPUB] task={task['id']} "
-                                    f"group={group_id} ok"
-                                )
-                            else:
-                                print(
-                                    f"[GROUP DIRECT EPUB] task={task['id']} "
-                                    f"group={group_id} failed"
-                                )
-                        except Exception as err:
                             print(
-                                f"[GROUP DIRECT EPUB ERROR] task={task['id']} "
-                                f"group={group_id}: {err}"
+                                f"[GROUP DIRECT EPUB] task={task['id']} "
+                                f"group={group_id} {'ok' if sent else 'failed'}"
                             )
+                    except Exception as err:
+                        print(
+                            f"[GROUP DIRECT PACKAGE ERROR] task={task['id']} "
+                            f"group={group_id}: {err}"
+                        )
                     time.sleep(delay)
 
             threading.Thread(target=_direct_group_upload, daemon=True).start()
