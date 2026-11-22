@@ -444,8 +444,11 @@ last_bot_messages = {}  # user_id -> list of final messages
 pending_urls = {}
 pending_retry_urls = {}  # user_id -> chat_id; the next message must be the completed task URL
 pending_cancel_tasks = {}  # user_id -> ordered list of cancelable tasks, expires after 10 minutes
+pending_reply_states = {}  # chat_id -> {token, user_id, kind}; timed text-reply prompts only
 
 pending_range_state = {}  # user_id -> {token, chat_id, url, version, title, total_chapters, user_id, username, first_name, last_name}
+
+REPLY_PROMPT_TIMEOUT_SECONDS = 600
 
 
 # ---------------------- HELPER FUNCTIONS ----------------------
@@ -634,6 +637,60 @@ def user_responded(user_id):
             args=(msg.chat.id, msg.message_id, 60),
             daemon=True
         ).start()
+
+def _clear_timed_reply(chat_id, user_id=None):
+    """Remove one timed text prompt and its TeleBot next-step callback."""
+    state = pending_reply_states.pop(chat_id, None)
+    owner_id = user_id if user_id is not None else (state or {}).get("user_id")
+
+    try:
+        bot.clear_step_handler_by_chat_id(chat_id)
+    except Exception:
+        pass
+
+    if owner_id is not None:
+        pending_retry_urls.pop(owner_id, None)
+        pending_cancel_tasks.pop(owner_id, None)
+
+
+def _complete_timed_reply(chat_id, user_id):
+    """Mark the active timed prompt answered without clearing a newer callback."""
+    state = pending_reply_states.get(chat_id)
+    if state and state["user_id"] == user_id:
+        pending_reply_states.pop(chat_id, None)
+
+
+def _reply_prompt_timeout(chat_id, token, delay):
+    time.sleep(delay)
+    state = pending_reply_states.get(chat_id)
+    if not state or state["token"] != token:
+        return
+
+    user_id = state["user_id"]
+    _clear_timed_reply(chat_id, user_id)
+    send_temp_message(
+        chat_id,
+        "⌛ This request expired after 10 minutes. Send the command again when you are ready.",
+        user_id,
+    )
+
+
+def register_timed_next_step(chat_id, user_id, handler, kind, *args, timeout=REPLY_PROMPT_TIMEOUT_SECONDS):
+    """Replace any older text reply prompt in this chat and expire this one safely."""
+    _clear_timed_reply(chat_id)
+    token = uuid.uuid4().hex
+    pending_reply_states[chat_id] = {
+        "token": token,
+        "user_id": user_id,
+        "kind": kind,
+    }
+    bot.register_next_step_handler_by_chat_id(chat_id, handler, *args)
+    threading.Thread(
+        target=_reply_prompt_timeout,
+        args=(chat_id, token, timeout),
+        daemon=True,
+    ).start()
+
 
 def edit_and_autodelete(chat_id, message_id, text, delay=300, parse_mode=None):
     try:
@@ -1210,6 +1267,7 @@ def request_preview(url, version, user_id, chat_id, username=None, first_name=No
         conn.close()
 
 def start_range_timeout(user, chat_id, url, version, title, total_chapters, delay=600):
+    _clear_timed_reply(chat_id, user.id)
     token = str(uuid.uuid4())
     pending_range_state[user.id] = {
         "token": token,
@@ -2404,6 +2462,7 @@ if SERVER_ID == "s1":
     def get_cancel_task_selection(message):
         user_id = message.from_user.id
         chat_id = message.chat.id
+        _complete_timed_reply(chat_id, user_id)
 
         tasks = pending_cancel_tasks.pop(user_id, None)
         if not tasks:
@@ -2548,7 +2607,6 @@ if SERVER_ID == "s1":
 
         # Save only this user's task list; later input cannot cancel anyone else's task.
         pending_cancel_tasks[user_id] = tasks
-        cancel_selection_timeout(user_id)
 
         text = "📋 Your pending/running downloads:\n\n"
         for number, task in enumerate(tasks, start=1):
@@ -2582,9 +2640,11 @@ if SERVER_ID == "s1":
             user_id,
         )
 
-        bot.register_next_step_handler_by_chat_id(
+        register_timed_next_step(
             chat_id,
+            user_id,
             get_cancel_task_selection,
+            'cancel',
         )
         bot.answer_callback_query(call.id)
 
@@ -3040,11 +3100,12 @@ if SERVER_ID == "s1":
             "Shortcuts: /retry <task_id>  or  /retry <url>",
             user_id,
         )
-        bot.register_next_step_handler_by_chat_id(chat_id, receive_retry_url)
+        register_timed_next_step(chat_id, user_id, receive_retry_url, "retry")
 
     def receive_retry_url(message):
         user_id = message.from_user.id
         chat_id = message.chat.id
+        _complete_timed_reply(chat_id, user_id)
         if pending_retry_urls.pop(user_id, None) != chat_id:
             return
 
@@ -3092,7 +3153,13 @@ if SERVER_ID == "s1":
             return
 
         send_prompt(message.chat.id, "📌 Enter novel URL:", message.from_user.id)
-        bot.register_next_step_handler(message, get_url, version)
+        register_timed_next_step(
+            message.chat.id,
+            message.from_user.id,
+            get_url,
+            "url",
+            version,
+        )
 
 
     def insert_task_direct(
@@ -3275,6 +3342,7 @@ if SERVER_ID == "s1":
         url = message.text.strip()
         user_id = message.from_user.id
         chat_id = message.chat.id
+        _complete_timed_reply(chat_id, user_id)
 
         banned_site = find_banned_site(url)
         if banned_site:
@@ -3512,7 +3580,7 @@ if SERVER_ID == "s1":
         # Existing version selection flow
         version = call.data.replace("version_", "")
         send_prompt(chat_id, "📌 Enter novel URL:", user_id)
-        bot.register_next_step_handler_by_chat_id(chat_id, get_url, version)
+        register_timed_next_step(chat_id, user_id, get_url, "url", version)
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("range_"))
