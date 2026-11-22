@@ -31,11 +31,11 @@ apihelper.CONNECT_TIMEOUT = 30
 TOKEN = os.environ.get("BOT_TOKEN", "")
 if not TOKEN:
     raise SystemExit("BOT_TOKEN env var is missing.")
-MY_GROUP_ID = "@novelsFinder"
+MY_GROUP_ID = "@hi"
 BOREAL_PRIVATE_GROUP_ID = -1003389806855
 BOREAL_OTHER_GROUP = "@selesste"
 OTHER_GROUP_ID = "@patiorjunrick1"
-BLOCKED_GROUP_USERNAME = "@novelsFinder"
+BLOCKED_GROUP_USERNAME = "@hi"
 ADMIN_USER_ID = [7994985826,  8402824940, 7378945311]
 UPLOAD_RETRY_DELAY_MINUTES = 10
 UPLOAD_RETRY_KEEP_HOURS = 12
@@ -4375,8 +4375,8 @@ def crawl_task(task):
             (
                 "✅ Download completed!\n"
                 "You will receive your file soon...\n"
-                "Backup file will be sent to @novelsFinder and "
-                "https://t.me/patiorjunrick1\n"
+                "Backup file will be sent to "
+                "@patiorjunrick1\n"
             ),
             user_id
         )
