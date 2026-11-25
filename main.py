@@ -3280,7 +3280,7 @@ if SERVER_ID == "s4":
 
 
     @bot.message_handler(commands=['queue'])
-    def queue(message):
+    def queue_command(message):
         conn = get_db_connection()
         if not conn:
             send_temp_message(
