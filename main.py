@@ -5946,7 +5946,7 @@ if LOCAL_BOT_API_URL:
 # ---------------------- RUN BOT ----------------------
 if SERVER_ID == "s4":
     print("[MODE] s4 – polling enabled")
-    bot.infinity_polling()
+    bot.infinity_polling(skip_pending=True)
 
 else:
     print(f"[MODE] {SERVER_ID} – worker only (no polling)")
