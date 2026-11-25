@@ -3,6 +3,7 @@ import subprocess
 import os
 import shutil
 import threading
+import queue
 import time
 import datetime
 import psycopg2
@@ -1145,6 +1146,8 @@ def _crawl_v4_with_progress_impl(
     output_format="epub",
     on_convert_start=None,
     on_epub_ready=None,
+    on_part_ready=None,
+    on_convert_note=None,
 ):
     """Download the selected v4 chapters once, then fetch images and create the EPUB
     (or the requested output format)."""
@@ -1356,21 +1359,65 @@ def _crawl_v4_with_progress_impl(
                     on_convert_start(output_format)
                 except Exception as e:
                     print(f"[CONVERT NOTIFY] {e}")
-            try:
-                artifact = ctx.binder.make_artifact(
-                    novel.id,
-                    novel.title,
-                    format=target_format,
-                    user_id=user.id,
-                    epub=artifact,
-                    signal=cancel_event,
-                )
-            except Exception:
-                if cancel_event.is_set():
-                    raise Exception("Cancelled")
-                raise
-            if not artifact.is_available:
-                raise Exception(f"Failed to convert EPUB to {output_format.upper()}")
+            # Big books are converted in parts (see SPLIT SIZES): each part goes to
+            # on_part_ready as soon as it is finished.
+            split_size = get_split_size(output_format)
+            use_parts = False
+            _calibre = None
+            if split_size and on_part_ready:
+                try:
+                    from lncrawl.services.binder import calibre as _calibre
+                    use_parts = _calibre.count_epub_chapters(artifact) > split_size
+                except Exception as e:
+                    print(f"[SPLIT] could not count chapters, converting in one piece: {e}")
+            if use_parts:
+                epub_artifact = artifact
+                epub_stem = split_artifact_name(
+                    os.path.basename(str(ctx.files.resolve(epub_artifact.output_file)))
+                )[0]
+                parts_dir = ctx.files.resolve(epub_artifact.output_file).parent / "parts"
+                try:
+                    _calibre.convert_epub_parts(
+                        epub_artifact,
+                        target_format,
+                        split_size,
+                        parts_dir,
+                        epub_stem,
+                        signal=cancel_event,
+                        on_part_ready=on_part_ready,
+                    )
+                except Exception:
+                    if cancel_event.is_set():
+                        raise Exception("Cancelled")
+                    raise
+                finally:
+                    shutil.rmtree(parts_dir, ignore_errors=True)
+                # `artifact` stays the EPUB; the caller ignores it because the parts
+                # were already delivered through on_part_ready.
+            else:
+                try:
+                    artifact = ctx.binder.make_artifact(
+                        novel.id,
+                        novel.title,
+                        format=target_format,
+                        user_id=user.id,
+                        epub=artifact,
+                        signal=cancel_event,
+                    )
+                except Exception:
+                    if cancel_event.is_set():
+                        raise Exception("Cancelled")
+                    raise
+                if not artifact.is_available:
+                    raise Exception(f"Failed to convert EPUB to {output_format.upper()}")
+                # Chapters that Calibre could not render were cleaned or skipped.
+                try:
+                    from lncrawl.services.binder import calibre as _calibre_rep
+                    report = _calibre_rep.convert_reports.pop(cancel_event, None)
+                    if report and on_convert_note:
+                        on_convert_note(report)
+                except Exception as e:
+                    print(f"[CONVERT NOTE] {e}")
 
     file = ctx.files.resolve(artifact.output_file)
 
@@ -1441,6 +1488,29 @@ def format_picker_markup(show_all=False):
     kb.row(telebot.types.InlineKeyboardButton("⬅ Back", callback_data="fmt_back"))
     return kb
 
+# ---------------------- SPLIT SIZES (chapters per converted file) ----------------------
+# Calibre formats are converted in parts of N chapters: each part is a small, fast
+# conversion that is sent as soon as it is done, and one bad part cannot ruin the rest.
+# 0 = never split (one file with every chapter). EPUB and text are never split.
+# Admins change the sizes with /split; they are stored in bot_settingz so every worker agrees.
+SPLIT_DEFAULTS = {"pdf": 500}  # every other format defaults to 0 = all chapters in one file
+SPLITTABLE_FORMATS = [k for k, (_label, _native) in OUTPUT_FORMATS.items() if not _native]
+SPLIT_MIN, SPLIT_MAX = 20, 5000
+
+def get_split_size(fmt):
+    """Chapters per file for this format; 0 means do not split."""
+    fmt = normalize_output_format(fmt)
+    if fmt not in SPLITTABLE_FORMATS:
+        return 0
+    default = SPLIT_DEFAULTS.get(fmt, 0)
+    raw = str(_api_setting_get(f"split_size_{fmt}", "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
 # ---------------------- NEW: V3 LIBRARY INTEGRATION ----------------------
 # Same idea as v4: call the v3 library (`lncrawl.core.app.App`) directly
 # instead of shelling out. `App.start_download(signal=...)` is a generator
@@ -1463,6 +1533,8 @@ def crawl_v4_with_progress(
     output_format="epub",
     on_convert_start=None,
     on_epub_ready=None,
+    on_part_ready=None,
+    on_convert_note=None,
 ):
     """Run v4 while restoring its global image setting after this task."""
     ctx, _ = _v4()
@@ -1480,6 +1552,8 @@ def crawl_v4_with_progress(
             output_format=output_format,
             on_convert_start=on_convert_start,
             on_epub_ready=on_epub_ready,
+            on_part_ready=on_part_ready,
+            on_convert_note=on_convert_note,
         )
     finally:
         ctx.config.crawler.ignore_images = previous_ignore_images
@@ -2665,6 +2739,73 @@ if SERVER_ID == "s4":
             send_temp_message(message.chat.id, f"Chapter images are enabled again for {domain}.", message.from_user.id)
         finally:
             conn.close()
+
+    def _split_overview():
+        lines = ["✂️ Split size = chapters per converted file (EPUB and Text are never split)\n"]
+        for fmt in SPLITTABLE_FORMATS:
+            size = get_split_size(fmt)
+            default = SPLIT_DEFAULTS.get(fmt, 0)
+            raw = str(_api_setting_get(f"split_size_{fmt}", "") or "").strip()
+            value = f"{size} chapters" if size else "all chapters in one file"
+            note = " (default)" if not raw else (f" (default is {default or 'all'})" if size != default else " (same as default)")
+            lines.append(f"• {fmt}: {value}{note}")
+        lines.append(
+            "\nChange it:\n"
+            "/split pdf 500\n"
+            "/split 300 mobi\n"
+            "/split pdf all  (do not split)\n"
+            "/split pdf default  (back to the default)\n"
+            f"Allowed sizes: {SPLIT_MIN}-{SPLIT_MAX} chapters."
+        )
+        return "\n".join(lines)
+
+    @bot.message_handler(commands=['split'])
+    def split_command(message):
+        if not _require_site_admin(message):
+            return
+        args = (message.text or "").split()[1:]
+        if not args:
+            safe_send_message(message.chat.id, _split_overview())
+            return
+
+        fmt, value = None, None
+        for arg in args:
+            low = arg.lower().lstrip(".")
+            if low in OUTPUT_FORMATS:
+                fmt = low
+            elif low in ("all", "off", "none", "no", "0"):
+                value = 0
+            elif low in ("default", "reset"):
+                value = ""
+            elif low.isdigit():
+                value = int(low)
+            else:
+                safe_send_message(message.chat.id, f"I do not understand '{arg}'.\n\n" + _split_overview())
+                return
+
+        if fmt is None or value is None:
+            safe_send_message(message.chat.id, "Give a format and a size, for example /split pdf 500\n\n" + _split_overview())
+            return
+        if fmt not in SPLITTABLE_FORMATS:
+            safe_send_message(
+                message.chat.id,
+                f"{fmt} cannot be split: it is built directly, not converted by Calibre.\n"
+                f"Formats you can split: {', '.join(SPLITTABLE_FORMATS)}",
+            )
+            return
+        if isinstance(value, int) and value != 0 and not (SPLIT_MIN <= value <= SPLIT_MAX):
+            safe_send_message(message.chat.id, f"Use a size between {SPLIT_MIN} and {SPLIT_MAX} chapters, or 'all'.")
+            return
+
+        if not _api_setting_set(f"split_size_{fmt}", value):
+            safe_send_message(message.chat.id, "Database error, the setting was not saved.")
+            return
+        size = get_split_size(fmt)
+        if size:
+            result = f"✅ {fmt.upper()} files will be made in parts of {size} chapters (books with fewer chapters stay in one file)."
+        else:
+            result = f"✅ {fmt.upper()} will be made as one file with all chapters."
+        safe_send_message(message.chat.id, result)
 
     @bot.message_handler(commands=['bansite'])
     def bansite(message):
@@ -4847,6 +4988,114 @@ def crawl_task(task):
         early["thread"] = t
         t.start()
 
+    # Conversion in parts (big books): every finished part is sent to the user right
+    # away by a background sender, so nothing waits for the last part.
+    parts_state = {
+        "active": False,
+        "total": 0,
+        "sent": 0,
+        "failed": 0,
+        "msg_ids": [],   # message ids of delivered parts (copied into the groups later)
+        "unsent": [],    # [(path, caption)] parts Telegram refused: retry + direct group upload
+        "queue": queue.Queue(),
+        "thread": None,
+    }
+    convert_started = {"v": False}
+    convert_note = {"text": ""}
+
+    def _part_caption(res):
+        caption = split_artifact_name(res["name"])[0].strip()
+        if res.get("skipped"):
+            caption += (
+                "\n⚠️ Not rendered here (the text is in the EPUB): chapter "
+                + ", ".join(str(n) for n in res["skipped"][:15])
+            )
+        if res.get("cleaned") or res.get("emoji_removed"):
+            caption += "\nℹ️ Emoji and symbols were removed from this file so it could be built."
+        return caption[:1021] + "..." if len(caption) > 1024 else caption
+
+    def _deliver_part(res):
+        if res.get("error"):
+            parts_state["failed"] += 1
+            err = str(res["error"]).strip().splitlines()[-1][:300] if str(res["error"]).strip() else "unknown error"
+            try:
+                send_task_message_24h(
+                    chat_id,
+                    (
+                        f"⚠️ Part {res['index']} of {res['total']} (chapters {res['first']}-{res['last']}) "
+                        f"could not be converted to {output_format.upper()}: {err}\n\n"
+                        "The other parts continue. Those chapters are in the EPUB."
+                    ),
+                    user_id,
+                )
+            except Exception as e:
+                print(f"[PART FAIL NOTIFY] task={task_id}: {e}")
+            return
+        file_path = res["path"]
+        caption = _part_caption(res)
+        size = os.path.getsize(file_path) if os.path.isfile(file_path) else 0
+        with _local_api_lock:
+            using_local = _local_api_available and bool(LOCAL_BOT_API_URL)
+        if not using_local and size > 48 * 1024 * 1024:
+            print(f"[PART SEND] task={task_id} part {res['index']} is {size} bytes > 48 MB and no local API")
+            sent = None
+        else:
+            print(f"[PART SEND] task={task_id} part {res['index']}/{res['total']} caption={caption!r}")
+            sent = send_document_with_retry(
+                chat_id=chat_id, file_path=file_path, caption=caption, max_retries=1
+            )
+        if sent:
+            parts_state["msg_ids"].append(sent.message_id)
+            parts_state["sent"] += 1
+        else:
+            parts_state["unsent"].append((file_path, caption))
+
+    def _parts_sender():
+        # Keep the chat order right: cover, synopsis and the EPUB go first.
+        early_thread = early["thread"]
+        if early_thread is not None:
+            early_thread.join(timeout=900)
+        while True:
+            res = parts_state["queue"].get()
+            if res is None:
+                return
+            try:
+                _deliver_part(res)
+            except Exception as e:
+                print(f"[PART DELIVER ERROR] task={task_id}: {type(e).__name__}: {e}")
+                if res.get("path") and os.path.isfile(res["path"]):
+                    parts_state["unsent"].append((res["path"], _part_caption(res)))
+
+    def on_part_ready(res):
+        """Called by Calibre as each part finishes (or fails)."""
+        parts_state["active"] = True
+        parts_state["total"] = res.get("total", 0)
+        if res.get("path"):
+            # Move it out of the novel cache now: that folder is wiped when the conversion ends.
+            try:
+                dest = os.path.join(temp_folder, os.path.basename(res["path"]))
+                shutil.move(res["path"], dest)
+                res["path"] = dest
+            except Exception as e:
+                print(f"[PART MOVE] task={task_id}: {e}")
+        if parts_state["thread"] is None:
+            t = threading.Thread(target=_parts_sender, daemon=True)
+            parts_state["thread"] = t
+            t.start()
+        parts_state["queue"].put(res)
+
+    def on_convert_note(report):
+        """A non-split conversion had to clean or skip stuck chapters."""
+        lines = []
+        if report.get("placeholder"):
+            lines.append(
+                "⚠️ Chapter(s) that could not be rendered in this file (the text is in the EPUB): "
+                + ", ".join(str(n) for n in report["placeholder"][:20])
+            )
+        if report.get("cleaned") or report.get("emoji_removed"):
+            lines.append("ℹ️ Emoji and symbols were removed from this file so it could be built.")
+        convert_note["text"] = "\n".join(lines)
+
     convert_last_edit = {"t": 0.0}
     # The progress message sits above the early EPUB in the chat. Once the EPUB is
     # delivered, the progress message is moved below it (old one deleted, new one sent).
@@ -4859,16 +5108,20 @@ def crawl_task(task):
         elapsed = float(info.get("elapsed") or 0)
         eta = info.get("eta")
         _sd, _st = int(info.get("sub_done") or 0), int(info.get("sub_total") or 0)
+        parts_n = int(info.get("parts") or 1)
+        part_i = int(info.get("part") or 1)
+        part_txt = f" (part {part_i}/{parts_n})" if parts_n > 1 else ""
+        overall_eta = info.get("overall_eta")
         progress_snapshot.update({
             "done": _sd,
             "total": _st,
             "pct": (_sd / _st * 100) if _st else pct,
             "status": (
-                f"Converting to {output_format.upper()}: rendering {_sd}/{_st}"
-                if _st else f"Converting to {output_format.upper()} ({stage})"
+                f"Converting to {output_format.upper()}{part_txt}: rendering {_sd}/{_st}"
+                if _st else f"Converting to {output_format.upper()}{part_txt} ({stage})"
             ),
             "elapsed": elapsed,
-            "remaining": float(eta or 0),
+            "remaining": float(overall_eta or eta or 0),
             "speed": 0.0,
             "title": title_holder["title"],
         })
@@ -4906,7 +5159,11 @@ def crawl_task(task):
                 f"📊 Progress: {pct:.0f}%\n"
                 f"📌 Status: {stage}\n\n"
             )
-        if eta and finishing:
+        if parts_n > 1 and overall_eta:
+            remaining_line = f"⌛ Remaining (all parts): ~{format_progress_duration(overall_eta)} (rough estimate)"
+        elif parts_n > 1:
+            remaining_line = "⌛ Remaining: estimating (shown after the first part is done)..."
+        elif eta and finishing:
             remaining_line = f"⌛ Remaining: ~{format_progress_duration(eta)} (rough estimate)"
         elif eta:
             remaining_line = (
@@ -4917,9 +5174,24 @@ def crawl_task(task):
             remaining_line = "⌛ Remaining: almost done..."
         else:
             remaining_line = "⌛ Remaining: estimating..."
+        if parts_n > 1:
+            header = (
+                f"🔄 Converting EPUB to {output_format.upper()} - part {part_i} of {parts_n} "
+                f"(chapters {info.get('first')}-{info.get('last')})...\n"
+                f"📦 Parts sent so far: {parts_state['sent']}/{parts_n}\n\n"
+            )
+        else:
+            header = f"🔄 Converting EPUB to {output_format.upper()}...\n\n"
+        stuck = info.get("skipped") or info.get("cleaned") or []
+        if stuck or int(info.get("attempt") or 1) > 1:
+            progress_lines += (
+                "⚠️ A chapter got stuck, retrying without it"
+                + (f" (chapter {', '.join(str(n) for n in sorted(set(stuck))[:6])})" if stuck else "")
+                + "\n\n"
+            )
         text = (
             f"{title_line()}"
-            f"🔄 Converting EPUB to {output_format.upper()}...\n\n"
+            f"{header}"
             f"{progress_lines}"
             f"⏱ Elapsed: {format_progress_duration(elapsed)}\n"
             f"{remaining_line}\n\n"
@@ -4953,6 +5225,7 @@ def crawl_task(task):
 
     def on_convert_start(fmt):
         """Tell the user the EPUB is being converted and keep the task from looking stuck."""
+        convert_started["v"] = True
         # Calibre reports progress through this listener (keyed by the cancel event,
         # which is the `signal` handed to the binder).
         try:
@@ -4996,6 +5269,8 @@ def crawl_task(task):
                 output_format=output_format,
                 on_convert_start=on_convert_start,
                 on_epub_ready=on_epub_ready,
+                on_part_ready=on_part_ready,
+                on_convert_note=on_convert_note,
             )
         else:
             epub_path, actual_total_chapters, novel_title, novel_synopsis, cover_source = crawl_v3_with_progress(
@@ -5007,6 +5282,8 @@ def crawl_task(task):
         import traceback
         stop_watcher.set()
         convert_done.set()
+        if parts_state["thread"] is not None:
+            parts_state["queue"].put(None)  # let the sender finish what it has and stop
         with running_lock:
             if running_processes.get(task_id) is cancel_event:
                 running_processes.pop(task_id, None)
@@ -5129,14 +5406,33 @@ def crawl_task(task):
         traceback.print_exc()
 
         try:
-            send_task_message(
-                chat_id,
-                f"⚠️ Download failed: {type(e).__name__}: {e}\n\n"
-                f"🔗 {url}\n\n"
-                f"Please check the link and make sure it leads to the novel info page. "
-                f"Or send /sources to check if the site is supported.",
-                user_id
-            )
+            err_text = f"{type(e).__name__}: {e}"
+            if len(err_text) > 700:
+                err_text = "..." + err_text[-700:]
+            if convert_started["v"]:
+                # The chapters were downloaded fine; only the format conversion failed.
+                already = []
+                if early["msg_ids"]:
+                    already.append("📚 Your EPUB was already sent above.")
+                if parts_state["sent"]:
+                    already.append(f"📦 {parts_state['sent']} part(s) were already sent.")
+                send_task_message(
+                    chat_id,
+                    f"⚠️ Conversion to {output_format.upper()} failed: {err_text}\n\n"
+                    f"🔗 {url}\n\n"
+                    + ("\n".join(already) + "\n" if already else "")
+                    + "Try again later, or choose EPUB.",
+                    user_id
+                )
+            else:
+                send_task_message(
+                    chat_id,
+                    f"⚠️ Download failed: {err_text}\n\n"
+                    f"🔗 {url}\n\n"
+                    f"Please check the link and make sure it leads to the novel info page. "
+                    f"Or send /sources to check if the site is supported.",
+                    user_id
+                )
         except Exception as notify_err:
             print(f"[NOTIFY ERROR] Task {task_id}: {notify_err}")
         mark_failed(task_id, keep_retryable=bool(task.get("is_user_retry")))
@@ -5150,10 +5446,27 @@ def crawl_task(task):
     if convert_msg["id"]:
         cleanup_bot_message(user_id, chat_id, convert_msg["id"])
 
+    # Parts were sent while converting; wait for the last uploads to finish.
+    if parts_state["thread"] is not None:
+        parts_state["queue"].put(None)
+        sender = parts_state["thread"]
+        wait_until = time.time() + 3 * 3600
+        while sender.is_alive() and time.time() < wait_until:
+            sender.join(timeout=60)
+            _touch_progress(task_id)
+
     epub_folder = os.path.dirname(epub_path)
     original_name = os.path.basename(epub_path)
+    parts_display = ""
 
-    if task['crawler_version'] == "v4":
+    if parts_state["active"]:
+        # Every part was already delivered (or queued as unsent); nothing to rename.
+        epub_folder = temp_folder
+        name_root, _ext = split_artifact_name(original_name)
+        suffix = range_suffix_for_filename(chapter_range, actual_total_chapters)
+        parts_display = f"{name_root} {suffix}" if suffix else name_root
+        epub_files = []
+    elif task['crawler_version'] == "v4":
         name_root, ext = split_artifact_name(original_name)
         suffix = range_suffix_for_filename(chapter_range, actual_total_chapters)
         new_name = f"{name_root} {suffix}{ext}" if suffix else f"{name_root}{ext}"
@@ -5174,9 +5487,13 @@ def crawl_task(task):
         final_msg = send_temp_message(
             chat_id,
             (
-                "✅ Download completed!\n"
-                "You will receive your file soon...\n"
-                "Backup file will be sent to "
+                (
+                    f"✅ All {parts_state['total']} parts are done!\n"
+                    if parts_state["active"] else
+                    "✅ Download completed!\n"
+                    "You will receive your file soon...\n"
+                )
+                + "Backup file will be sent to "
                 "@patiorjunrick1\n"
             ),
             user_id
@@ -5189,14 +5506,16 @@ def crawl_task(task):
         # uploading, so message order and ids are settled before the final file.
         if early["thread"] is not None:
             early["thread"].join(timeout=900)
-        message_ids_to_forward = list(early["msg_ids"])
+        message_ids_to_forward = list(early["msg_ids"]) + list(parts_state["msg_ids"])
         # Paths that failed user delivery — groups get a direct upload later.
         direct_group_epubs = []  # list of (file_path, caption)
 
         # Message 1: cover image and compact information caption.
         # The filename without ".epub" includes the requested range, e.g. c1-500.
-        first_file_name = epub_files[0]
-        display_title = split_artifact_name(first_file_name)[0]
+        display_title = (
+            parts_display if parts_state["active"]
+            else split_artifact_name(epub_files[0])[0]
+        )
 
         # Skipped when the cover + synopsis already went out with the early EPUB.
         if not early["cover_done"]:
@@ -5287,6 +5606,24 @@ def crawl_task(task):
 
                 continue
 
+        # Parts Telegram refused for the user: external links + direct group upload.
+        if parts_state["unsent"]:
+            for part_path, part_caption in parts_state["unsent"]:
+                queue_epub_upload_retry(task, part_path, part_caption)  # one retry slot per task
+                direct_group_epubs.append((part_path, part_caption))
+            conn = get_db_connection()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE trial
+                            SET status='upload_failed', completed_at=NOW()
+                            WHERE id=%s AND status!='cancelled';
+                        """, (task["id"],))
+                        conn.commit()
+                finally:
+                    conn.close()
+
         # Copy whatever we successfully sent to the user into groups.
         if message_ids_to_forward:
             forward_messages_to_groups_sequentially(
@@ -5303,24 +5640,25 @@ def crawl_task(task):
             def _direct_group_upload():
                 for group_id in groups:
                     try:
-                        group_cover = send_cover_post(
-                            group_id,
-                            cover_source,
-                            display_title,
-                            url,
-                            task["crawler_version"],
-                        )
-                        if not group_cover:
-                            print(f"[GROUP COVER FAILED] task={task['id']} group={group_id}")
-
-                        for synopsis_message in build_synopsis_messages(novel_synopsis):
-                            if not send_message_with_retry(
+                        if not parts_state["active"]:
+                            group_cover = send_cover_post(
                                 group_id,
-                                synopsis_message,
-                                parse_mode="HTML",
-                                max_retries=1,
-                            ):
-                                print(f"[GROUP SYNOPSIS FAILED] task={task['id']} group={group_id}")
+                                cover_source,
+                                display_title,
+                                url,
+                                task["crawler_version"],
+                            )
+                            if not group_cover:
+                                print(f"[GROUP COVER FAILED] task={task['id']} group={group_id}")
+
+                            for synopsis_message in build_synopsis_messages(novel_synopsis):
+                                if not send_message_with_retry(
+                                    group_id,
+                                    synopsis_message,
+                                    parse_mode="HTML",
+                                    max_retries=1,
+                                ):
+                                    print(f"[GROUP SYNOPSIS FAILED] task={task['id']} group={group_id}")
 
                         for fpath, fcap in direct_group_epubs:
                             sent = send_document_with_retry(
@@ -5377,6 +5715,9 @@ def crawl_task(task):
                 conn.commit()
             finally:
                 conn.close()
+
+        if convert_note["text"]:
+            send_task_message_24h(chat_id, convert_note["text"], user_id, is_final=True)
 
         if missing_chapter_count:
             # Keep visible for the full 20-hour retry window, then auto-delete.
