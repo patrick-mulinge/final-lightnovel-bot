@@ -232,8 +232,8 @@ if not LOCAL_BOT_API_URL:
     apihelper.API_URL = OFFICIAL_API_URL
     print("[LOCAL BOT API] No LOCAL_BOT_API_URL set – using official Telegram cloud only")
 
-import logging
-telebot.logger.setLevel(logging.DEBUG)
+#import logging
+#telebot.logger.setLevel(logging.DEBUG)
 
 # ---- NEW: v3 and v4 are both installed as a top-level package literally
 # named `lncrawl`, so a given server only ever has ONE of them on disk
