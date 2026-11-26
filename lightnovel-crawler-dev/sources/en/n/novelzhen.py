@@ -1,73 +1,42 @@
-﻿"""Crawler for novelzhen.com."""
+# -*- coding: utf-8 -*-
+"""Crawler for novelzhen.com."""
 
 import re
 from typing import Optional
 
-from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate, Volume
+from lncrawl.core import Chapter, Novel, PageSoup, SearchResult, SoupTemplate, Volume
 
 
 class NovelZhenCrawler(SoupTemplate):
-    """Crawl novels published on NovelZhen."""
-
     base_url = ["https://novelzhen.com/"]
     language = "en"
-    has_mtl = False
-    has_manga = False
-    can_search = False
-
+    can_search = True
     novel_title_selector = "h1"
     chapter_list_selector = 'a[href*="-chapter-"]'
     chapter_body_selector = "div.chapter-content"
+
+    def search(self, query):
+        data = self.post_response(f"{self.scraper.origin.rstrip('/')}/api/searchhome", json={"query": query}).json()
+        for item in data.get("results", []):
+            title, slug = item.get("title"), item.get("slug")
+            if title and slug:
+                yield SearchResult(title=title, url=f"{self.scraper.origin.rstrip('/')}/novel/{slug}", author=item.get("author", ""))
 
     def _chapter_number(self, href: str) -> Optional[int]:
         match = re.search(r"-chapter-(\d+)(?:/)?$", href or "")
         return int(match.group(1)) if match else None
 
-    def parse_chapter_url(self, soup: PageSoup, chapter: Chapter) -> None:
+    def parse_chapter_url(self, soup: PageSoup, chapter: Chapter):
         chapter.url = self.absolute_url(soup.get("href", ""))
 
-    def parse_chapter_body(self, soup: PageSoup, chapter: Chapter) -> None:
+    def parse_chapter_body(self, soup: PageSoup, chapter: Chapter):
         chapter.body = self.cleaner.extract_contents(soup)
 
-    def parse_toc(self, soup: PageSoup, novel: Novel) -> None:
-        """Expand NovelZhen's paged 50-chapter catalog into individual chapters."""
-        links: dict[int, tuple[str, str]] = {}
-
+    def parse_toc(self, soup: PageSoup, novel: Novel):
+        links = {}
         for anchor in soup.select(self.chapter_list_selector):
-            href = anchor.get("href", "")
-            number = self._chapter_number(href)
-            if number is None:
-                continue
-
-            text = anchor.get_text(" ", strip=True)
-            title_match = re.search(
-                rf"(?:#?\s*)?{number}\s*\.??\s*Chapter\s*{number}(?:\s*:\s*(.*?))?(?:\s+\d+\s+months?\s+ago)?$",
-                text,
-                re.IGNORECASE,
-            )
-            title = (
-                f"Chapter {number}: {title_match.group(1).strip()}"
-                if title_match and title_match.group(1)
-                else f"Chapter {number}"
-            )
-            links[number] = (title, self.absolute_url(href))
-
-        if not links:
-            novel.volumes = [Volume(id=1)]
-            novel.chapters = []
-            return
-
-        max_number = max(links)
-        sample_url = next(iter(links.values()))[1]
-        url_template = re.sub(r"-chapter-\d+/?$", "-chapter-{number}", sample_url)
-
+            number = self._chapter_number(anchor.get("href", ""))
+            if number is not None:
+                links[number] = (anchor.get_text(" ", strip=True) or f"Chapter {number}", self.absolute_url(anchor["href"]))
         novel.volumes = [Volume(id=1)]
-        novel.chapters = [
-            Chapter(
-                id=number,
-                volume=1,
-                title=links.get(number, (f"Chapter {number}", ""))[0],
-                url=links.get(number, ("", url_template.format(number=number)))[1],
-            )
-            for number in range(1, max_number + 1)
-        ]
+        novel.chapters = [Chapter(id=number, volume=1, title=title, url=href) for number, (title, href) in sorted(links.items())]

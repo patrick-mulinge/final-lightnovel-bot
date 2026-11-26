@@ -2,33 +2,44 @@
 """Crawler for Novelib stories and chapters."""
 
 import re
-from urllib.parse import quote, urljoin
+from urllib.parse import urljoin
 
-from lncrawl.core import SearchResult
-
-from lncrawl.core import Chapter, LegacyCrawler, Volume
+from lncrawl.core import Chapter, LegacyCrawler, SearchResult, Volume
 
 
 class NovelibCrawler(LegacyCrawler):
     base_url = ["https://novelib.com/"]
     can_search = True
 
-    def search_novel(self, query):
-        url = f"{self.scraper.origin.rstrip('/')}/?s={quote(query)}&post_type=any"
-        soup = self.get_soup(url)
-        seen = set()
-        for link in soup.select("a[href]"):
-            href = link.get("href", "").split("#", 1)[0]
-            title = link.get_text(" ", strip=True)
-            if not href or not title or href in seen:
-                continue
-            if "/novel/" not in href and "/book/" not in href and "/story/" not in href:
-                continue
-            seen.add(href)
-            yield SearchResult(
-                title=title,
-                url=urljoin(self.scraper.origin, href),
-            )
+    def search_novel(self, query: str):
+        soup = self.get_soup(self.scraper.origin)
+        scripts = " ".join(script.get_text(" ") for script in soup.select("script"))
+        nonce_match = re.search(
+            r"action\s*:\s*['\"]fictioneer_unrestricted_search['\"].{0,300}?"
+            r"nonce\s*:\s*['\"]([^'\"]+)",
+            scripts,
+            re.DOTALL,
+        )
+        if not nonce_match:
+            return
+
+        response = self.submit_form(
+            f"{self.scraper.origin.rstrip('/')}/wp-admin/admin-ajax.php",
+            data={
+                "action": "fictioneer_unrestricted_search",
+                "search_term": query,
+                "nonce": nonce_match.group(1),
+            },
+        )
+        for item in response.json().get("data", []):
+            title = item.get("title")
+            href = item.get("link")
+            if title and href:
+                yield SearchResult(
+                    title=title,
+                    url=urljoin(self.scraper.origin, href),
+                    info=item.get("genres", ""),
+                )
 
     def initialize(self):
         self.cleaner.bad_tags.update(["script", "style", "nav", "form", "button"])
@@ -48,44 +59,37 @@ class NovelibCrawler(LegacyCrawler):
         synopsis = soup.select_one(
             ".story__description, .story__summary, .story__entry, .story__content"
         )
-        self.novel_synopsis = (
-            self.cleaner.extract_contents(synopsis) if synopsis else ""
-        )
+        self.novel_synopsis = self.cleaner.extract_contents(synopsis) if synopsis else ""
 
         image = soup.select_one("meta[property='og:image']")
         if image:
             self.novel_cover = urljoin(self.scraper.origin, image.get("content", ""))
         if not self.novel_cover:
-            image = soup.select_one("img.story__thumbnail-image, .story__cover img, .story__thumbnail img")
+            image = soup.select_one(
+                "img.story__thumbnail-image, .story__cover img, .story__thumbnail img"
+            )
             if image:
                 self.novel_cover = urljoin(self.scraper.origin, image.get("src", ""))
 
+        chapters_tab = soup.select_one('[data-tab-name="chapters"]') or soup.select_one(
+            "#tab-chapters"
+        )
+        if not chapters_tab:
+            raise RuntimeError("Novelib chapter catalogue was empty")
+
         self.volumes.append(Volume(id=1, title="Volume 1"))
         seen = set()
-        chapters_tab = next(
-            (
-                section for section in soup.find_all("section")
-                if section.get("data-tab-name") == "chapters"
-            ),
-            soup,
-        )
-        for link in chapters_tab.select(
-            "a.chapter-group__list-item-link[href*='/sde-ch-']"
-        ):
+        for link in chapters_tab.select("a.chapter-group__list-item-link[href]"):
             href = link.get("href", "").split("#", 1)[0].strip()
             if not href or href in seen:
                 continue
             seen.add(href)
-            text = link.get_text(" ", strip=True)
-            match = re.search(r"(?:chapter|ch)\s*([0-9]+(?:-[0-9]+)?)", text, re.I)
-            number = len(self.chapters) + 1
-            if match:
-                number = len(self.chapters) + 1
+            title = link.get_text(" ", strip=True)
             self.chapters.append(
                 Chapter(
-                    id=number,
+                    id=len(self.chapters) + 1,
                     volume=1,
-                    title=text or f"Chapter {number}",
+                    title=title or f"Chapter {len(self.chapters) + 1}",
                     url=urljoin(self.novel_url, href),
                 )
             )

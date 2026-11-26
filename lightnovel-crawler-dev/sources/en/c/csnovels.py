@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Crawler for CS Novels book and chapter pages."""
+"""Corrected CS Novels crawler replacement."""
 
 import json
-from html import escape
 import re
+from html import escape
 from urllib.parse import quote, urljoin, urlparse
 
 from lncrawl.core import Chapter, LegacyCrawler, SearchResult, Volume
@@ -14,79 +14,44 @@ class CsnovelsCrawler(LegacyCrawler):
     can_search = True
 
     def search_novel(self, query):
-        data = self.get_json(
-            f"{self.scraper.origin.rstrip('/')}/searchbook?query={quote(query)}"
-        )
-        for item in data.get("data", []):
-            slug = item.get("slug")
-            if not slug:
-                continue
-            yield SearchResult(
-                title=item.get("title") or slug.replace("-", " ").title(),
-                url=f"{self.scraper.origin.rstrip('/')}/book/{slug}",
-                info=item.get("status") or "",
-            )
+        soup = self.get_soup(f"{self.scraper.origin.rstrip('/')}/book-search?by=search&query={quote(query)}")
+        seen = set()
+        for link in soup.select("a[href*='/book/']"):
+            href = link.get("href", "").split("#", 1)[0]
+            title = link.get_text(" ", strip=True)
+            if href and title and href not in seen:
+                seen.add(href)
+                yield SearchResult(title=title, url=urljoin(self.scraper.origin, href))
 
     def read_novel_info(self):
-        self.novel_title = re.sub(r"[-_]+", " ", self.novel_url.rstrip("/").rsplit("/", 1)[-1]).title()
         soup = self.get_soup(self.novel_url)
         metadata = self._json_ld(soup)
-
-        title = soup.select_one("h1.bookTitle, .bookTitle")
         slug_match = re.search(r"/book/([^/?#]+)/?", urlparse(self.novel_url).path)
         slug = slug_match.group(1) if slug_match else ""
-        api_origin = self.scraper.origin.rstrip("/")
-        book_response = self.get_json(f"{api_origin}/getSingleBook?slug={slug}") if slug else {}
-        book_data = book_response.get("book", {}) if isinstance(book_response, dict) else {}
-        fallback_title = slug.replace("-", " ").title()
-        self.novel_title = book_data.get("title") or (title.get_text(" ", strip=True) if title else "") or metadata.get("name", "") or fallback_title or self.novel_title
+        response = self.get_json(f"{self.scraper.origin.rstrip('/')}/getSingleBook?slug={slug}") if slug else {}
+        book = response.get("book", {}) if isinstance(response, dict) else {}
+        heading = soup.select_one("h1.bookTitle, .bookTitle")
+        self.novel_title = book.get("title") or (heading.get_text(" ", strip=True) if heading else "") or metadata.get("name", "") or slug.replace("-", " ").title()
         description = soup.select_one('meta[name="description"], meta[property="og:description"]')
-        self.novel_synopsis = book_data.get("description", "") or (
-            description.get("content", "").strip() if description else metadata.get("description", "")
-        )
-        api_cover = book_data.get("coverimage") or book_data.get("coverImage")
-        if api_cover:
-            self.novel_cover = urljoin(api_origin, api_cover)
-        cover = soup.select_one('meta[property="og:image"]')
-        if cover and cover.get("content") and not getattr(self, "novel_cover", ""):
-            self.novel_cover = urljoin(self.scraper.origin, cover["content"])
-
+        self.novel_synopsis = book.get("description", "") or (description.get("content", "").strip() if description else metadata.get("description", ""))
+        cover = book.get("coverimage") or book.get("coverImage") or (soup.select_one('meta[property="og:image"]') or {}).get("content", "")
+        if cover:
+            self.novel_cover = urljoin(self.scraper.origin, cover)
+        author = soup.select_one('meta[property="og:novel:author"]')
+        if author:
+            self.novel_author = author.get("content", "").strip()
         self.volumes.append(Volume(id=1, title="Volume 1"))
         chapters = {}
-        for item in metadata.get("hasPart", []):
-            if not isinstance(item, dict):
-                continue
-            url = item.get("url", "")
-            match = re.search(r"/chapter/[^/]+/(\d+)/?$", url)
-            if match:
-                chapters[int(match.group(1))] = (item.get("name", ""), url)
-
         for link in soup.select('#chapter-list a[href*="/chapter/"]'):
-            href = link.get("href", "")
-            match = re.search(r"/chapter/[^/]+/(\d+)/?$", href)
+            match = re.search(r"/chapter/[^/]+/(\d+)/?$", link.get("href", ""))
             if match:
-                number = int(match.group(1))
-                chapters[number] = (link.get_text(" ", strip=True), urljoin(self.scraper.origin, href))
-
-        total = soup.select_one(".total-chapters, #number-of-chapters, #chapter-count")
-        total_match = re.search(r"\d+", total.get_text(" ", strip=True) if total else "")
-        slug_match = re.search(r"/book/([^/?#]+)/?", urlparse(self.novel_url).path)
-        slug = slug_match.group(1) if slug_match else ""
-        api_origin = self.scraper.origin.rstrip("/")
-        book_response = self.get_json(f"{api_origin}/getSingleBook?slug={slug}") if slug else {}
-        book_data = book_response.get("book", {}) if isinstance(book_response, dict) else {}
-        if not slug and chapters:
-            slug = next(iter(chapters.values()))[1].split("/chapter/", 1)[1].rsplit("/", 1)[0]
-        if slug:
-            total_count = int(book_data.get("chaptercount") or 0)
-            if not total_count and total_match:
-                total_count = int(total_match.group(0))
-            for number in range(1, total_count + 1):
-                chapters.setdefault(number, (f"Chapter {number}", f"{self.scraper.origin}/chapter/{slug}/{number}"))
-
+                chapters[int(match.group(1))] = (link.get_text(" ", strip=True), urljoin(self.novel_url, link["href"]))
+        count = int(book.get("chaptercount") or 0)
+        for number in range(1, count + 1):
+            chapters.setdefault(number, (f"Chapter {number}", f"{self.scraper.origin}/chapter/{slug}/{number}"))
         for number in sorted(chapters):
-            title, url = chapters[number]
-            self.chapters.append(Chapter(id=number, volume=1, title=title or f"Chapter {number}", url=url))
+            title, href = chapters[number]
+            self.chapters.append(Chapter(id=number, volume=1, title=title or f"Chapter {number}", url=href))
         if not self.chapters:
             raise RuntimeError("CS Novels chapter catalogue was empty")
 
@@ -94,32 +59,21 @@ class CsnovelsCrawler(LegacyCrawler):
         match = re.search(r"/chapter/([^/]+)/([0-9]+)/?", chapter.url)
         if match:
             slug, number = match.groups()
-            api_url = f"{self.scraper.origin.rstrip(chr(47))}/getsinglechapter?slug={slug}&chapternumber={number}"
-            data = self.get_json(api_url)
+            data = self.get_json(f"{self.scraper.origin.rstrip('/')}/getsinglechapter?slug={slug}&chapternumber={number}")
             if isinstance(data, dict) and data.get("chaptercontent"):
                 return self._format_chapter_text(data["chaptercontent"])
         soup = self.get_soup(chapter.url)
         content = soup.select_one(f"#chapter-{chapter.id}, #chapters-container .chapter")
-        if not content:
-            text = self._json_ld(soup).get("text", "")
-            return self._format_chapter_text(text)
-        for tag in content.select("script, style, nav, button, img, .ad-container, ins, iframe"):
-            tag.decompose()
-        heading = content.select_one(".chapter-title")
-        if heading:
-            heading.decompose()
-        return self.cleaner.extract_contents(content)
+        return self.cleaner.extract_contents(content) if content else self._format_chapter_text(self._json_ld(soup).get("text", ""))
 
     @staticmethod
-    @staticmethod
     def _format_chapter_text(text):
-        paragraphs = re.split(r"\n\s*\n", text.replace("noveldrama", "").strip())
-        formatted = []
-        for paragraph in paragraphs:
-            if paragraph.strip():
-                normalized = re.sub(r"\\s+", " ", paragraph).strip()
-                formatted.append("<p>" + escape(normalized) + "</p>")
-        return "".join(formatted)
+        normalized = []
+        for paragraph in re.split(r"\n\s*\n", text.replace("noveldrama", "").strip()):
+            paragraph = re.sub(r"\s+", " ", paragraph).strip()
+            if paragraph:
+                normalized.append(f"<p>{escape(paragraph)}</p>")
+        return "".join(normalized)
 
     @staticmethod
     def _json_ld(soup):
@@ -128,22 +82,6 @@ class CsnovelsCrawler(LegacyCrawler):
                 data = json.loads(script.string or script.get_text())
             except (TypeError, json.JSONDecodeError):
                 continue
-            if isinstance(data, dict) and data.get("@type") in ("Book", "Chapter"):
+            if isinstance(data, dict):
                 return data
         return {}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

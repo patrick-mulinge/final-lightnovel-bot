@@ -1,4 +1,3 @@
-from urllib.parse import quote
 # -*- coding: utf-8 -*-
 """Crawler for novelroll.com."""
 
@@ -7,21 +6,24 @@ import re
 
 from bs4 import BeautifulSoup
 
-from lncrawl.core import SearchResult, Chapter, LegacyCrawler, Volume
+from lncrawl.core import Chapter, LegacyCrawler, SearchResult, Volume
 
 
 class NovelrollCrawler(LegacyCrawler):
+    base_url = ["https://novelroll.com/"]
+    can_search = True
+
     def search_novel(self, query):
         page = self.get_soup(self.scraper.origin.rstrip("/") + "/")
-        component = page.select_one('[wire\:name="header.search"][wire\:id]')
+        component = page.select_one('[wire\\:name="header.search"][wire\\:id]')
         if not component:
             return
         snapshot = component.get("wire:snapshot")
-        component_id = component.get("wire:id")
-        if not snapshot or not component_id:
+        if not snapshot:
             return
+        token = page.select_one("meta[name=csrf-token]")
         payload = {
-            "_token": (page.select_one("meta[name=csrf-token]") or {}).get("content", ""),
+            "_token": token.get("content", "") if token else "",
             "components": [{
                 "snapshot": snapshot,
                 "updates": {"search": query},
@@ -33,19 +35,21 @@ class NovelrollCrawler(LegacyCrawler):
             json=payload,
             headers={"X-Livewire": "1", "X-Requested-With": "XMLHttpRequest"},
         ).json()
-        html = ""
-        for item in response.get("components", []):
-            html += (item.get("effects") or {}).get("html", "")
+        html = "".join(
+            (item.get("effects") or {}).get("html", "")
+            for item in response.get("components", [])
+        )
         results = BeautifulSoup(html, "html.parser")
         seen = set()
-        for link in results.select('a[href]'):
+        for link in results.select("a[href]"):
             href = link.get("href", "")
-            title = link.get_text(" ", strip=True)
-            if href and title and href not in seen and ("/novel/" in href or "/series/" in href):
-                seen.add(href)
-                yield SearchResult(title=title, url=self.absolute_url(href))
-    can_search = True
-    base_url = ["https://novelroll.com/"]
+            title = link.get("title") or link.get_text(" ", strip=True)
+            if not href or not title or href in seen:
+                continue
+            if not any(path in href for path in ("/book/", "/novel/", "/series/")):
+                continue
+            seen.add(href)
+            yield SearchResult(title=title, url=self.absolute_url(href))
 
     def _json_ld_book(self, soup):
         for script in soup.select('script[type="application/ld+json"]'):
@@ -53,10 +57,8 @@ class NovelrollCrawler(LegacyCrawler):
                 data = json.loads(script.get_text())
             except (TypeError, json.JSONDecodeError):
                 continue
-            if isinstance(data, dict) and isinstance(data.get("@graph"), list):
-                items = data["@graph"]
-            else:
-                items = data if isinstance(data, list) else [data]
+            items = data.get("@graph", []) if isinstance(data, dict) else data
+            items = items if isinstance(items, list) else [items]
             for item in items:
                 if isinstance(item, dict) and item.get("@type") == "Book":
                     return item
@@ -67,31 +69,18 @@ class NovelrollCrawler(LegacyCrawler):
         book = self._json_ld_book(soup)
         self.novel_title = str(book.get("name", "")).strip()
         self.novel_synopsis = str(book.get("description", "")).strip()
-        # JSON-LD contains a shortened description ending in "...". The
-        # expanded page renders the complete synopsis in this content block.
-        visible_synopsis = soup.select_one(
-            'div[x-ref="content"] div.text-left > div'
-        )
+        visible_synopsis = soup.select_one('div[x-ref="content"] div.text-left > div')
         if visible_synopsis:
-            full_synopsis = visible_synopsis.get_text(" ", strip=True)
-            if full_synopsis:
-                self.novel_synopsis = full_synopsis
+            self.novel_synopsis = visible_synopsis.get_text(" ", strip=True) or self.novel_synopsis
         if book.get("image"):
             self.novel_cover = self.absolute_url(str(book["image"]))
         author = book.get("author", "")
-        if isinstance(author, dict):
-            author = author.get("name", "")
-        self.novel_author = str(author).strip()
+        self.novel_author = str(author.get("name", "") if isinstance(author, dict) else author).strip()
 
-        # The normal page shows only a few newest and oldest links. ?toc loads
-        # the complete catalogue, still ordered newest chapter first.
         toc = self.get_soup(self.novel_url.rstrip("/") + "?toc")
-        book_path = self.novel_url.rstrip("/").split("novelroll.com", 1)[-1]
+        book_path = self.novel_url.rstrip("/").split("novelroll.com", 1)[-1].rstrip("/")
         if not book_path.startswith("/"):
             book_path = "/" + book_path
-        book_path = book_path.rstrip("/")
-        # JSON-LD includes the newest chapter even when the visible catalogue
-        # has not rendered it yet. Merge both sources, retaining page order.
         entries = [
             (item.get("url", ""), item.get("name", ""))
             for item in book.get("hasPart", [])
@@ -101,32 +90,21 @@ class NovelrollCrawler(LegacyCrawler):
             (link.get("href", ""), link.get("title") or link.get_text(" ", strip=True))
             for link in toc.select('a[href*="/chapter-"]')
         )
-        seen = set()
         self.volumes.append(Volume(id=1))
+        seen = set()
         for href, title in entries:
             href = href.strip()
-            if not href or href in seen:
-                continue
             if href.startswith("https://novelroll.com"):
                 href = href.split("novelroll.com", 1)[-1]
-            if not href.startswith(book_path + "/chapter-"):
+            if not href or href in seen or not href.startswith(book_path + "/chapter-"):
                 continue
-            seen.add(href)
             if not title.lower().startswith("chapter"):
                 continue
-            self.chapters.append(
-                Chapter(
-                    id=len(self.chapters) + 1,
-                    volume=1,
-                    title=title.strip(),
-                    url=self.absolute_url(href),
-                )
-            )
+            seen.add(href)
+            self.chapters.append(Chapter(id=len(self.chapters) + 1, volume=1, title=title.strip(), url=self.absolute_url(href)))
         if not self.chapters:
             raise RuntimeError("NovelRoll chapter catalogue was empty")
 
-        # NovelRoll displays newest chapters first, but lncrawl's --first and
-        # --last options are expected to operate in natural chapter order.
         def chapter_number(item):
             match = re.search(r"/chapter-(\d+)(?:-|$)", item.url)
             return int(match.group(1)) if match else item.id
@@ -140,15 +118,10 @@ class NovelrollCrawler(LegacyCrawler):
         content = soup.select_one("article[data-chapter-slug]") or soup.select_one("article.prose")
         if not content:
             return ""
-        for tag in content.select("script, style, img, nav, .not-prose"):
+        for tag in content.select("script, style, img, nav, .not-prose, h1, h2, h3"):
             tag.decompose()
-        for heading in content.select("h1, h2, h3"):
-            heading.decompose()
         for tag in list(content.find_all(True)):
             text = tag.get_text(" ", strip=True)
-            if re.match(r"^Previously\s+on\b", text, re.IGNORECASE):
-                tag.decompose()
-            elif text.lower() == "details":
+            if re.match(r"^Previously\s+on\b", text, re.IGNORECASE) or text.lower() == "details":
                 tag.decompose()
         return self.cleaner.extract_contents(content)
-

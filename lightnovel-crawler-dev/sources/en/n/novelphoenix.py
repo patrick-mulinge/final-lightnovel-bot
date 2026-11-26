@@ -1,65 +1,42 @@
 # -*- coding: utf-8 -*-
-import logging
+"""Crawler for novelphoenix.com."""
+
 import re
 from typing import Iterable, Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
-from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate, Volume
-
-logger = logging.getLogger(__name__)
-
-# Each row ends with how long ago the chapter went up.
-POSTED_AGO = re.compile(r"\s*\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\s*$", re.I)
-SPACES = re.compile(r"\s+")
+from lncrawl.core import Chapter, Novel, PageSoup, SearchResult, SoupTemplate, Volume
 
 
 class NovelPhoenixCrawler(SoupTemplate):
     base_url = ["https://novelphoenix.com/"]
-
+    can_search = True
     novel_title_selector = "h1"
     novel_synopsis_selector = "div.summary .content, div.description"
-
-    # `article` and `main` also hold the text, but each wraps it in the post header.
     chapter_body_selector = "#content"
 
-    def select_chapter_tags(
-        self, tag: PageSoup, novel: Novel, volume: Optional[Volume] = None
-    ) -> Iterable[PageSoup]:
-        # The novel page links only the newest chapter; the list lives one level down.
+    def search(self, query):
+        data = self.get_json(f"{self.scraper.origin.rstrip('/')}/ajax/searchLive?keyword={quote_plus(query)}&type=title")
+        for item in data.get("data", []):
+            title, slug = item.get("title"), item.get("slug")
+            if title and slug:
+                yield SearchResult(title=title, url=f"{self.scraper.origin.rstrip('/')}/novel/{slug}")
+
+    def select_chapter_tags(self, tag: PageSoup, novel: Novel, volume: Optional[Volume] = None) -> Iterable[PageSoup]:
         url = self.absolute_url(novel.url).split("?")[0].rstrip("/") + "/chapters"
         seen = set()
         while url and url not in seen:
             seen.add(url)
             soup = self.scraper.get_soup(url)
             yield from soup.select("ul.chapter-list li a[href]")
+            current = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
+            choices = []
+            for control in soup.select("a[href*='chapters?page='], option[value*='chapters?page=']"):
+                href = control.get("href") or control.get("value")
+                pages = parse_qs(urlsplit(href).query).get("page", [])
+                if pages and int(pages[0]) > current:
+                    choices.append((int(pages[0]), href))
+            url = self.absolute_url(min(choices)[1]) if choices else None
 
-            # The site does not consistently mark the next button with rel="next".
-            # Instead, follow the smallest pagination number greater than the page
-            # currently being fetched. This works even when the arrow text is hidden.
-            current_page = int(parse_qs(urlsplit(url).query).get("page", ["1"])[0])
-            candidates = []
-            page_controls = list(soup.select("a[href*='chapters?page=']"))
-            page_controls.extend(soup.select("option[value*='chapters?page=']"))
-            for link in page_controls:
-                href = link.get("href") or link.get("value")
-                if not href:
-                    continue
-                page_values = parse_qs(urlsplit(href).query).get("page", [])
-                if not page_values:
-                    continue
-                try:
-                    page_number = int(page_values[0])
-                except ValueError:
-                    continue
-                if page_number > current_page:
-                    candidates.append((page_number, href.split("#", 1)[0]))
-
-            if not candidates:
-                break
-            url = self.absolute_url(min(candidates)[1])
-
-    def parse_chapter_title(self, soup: PageSoup, chapter: Chapter) -> None:
-        # A row runs number, title and timestamp together with no separators between the
-        # spans, so the text has to be read with one inserted.
-        text = SPACES.sub(" ", soup.get_text(" ", strip=True))
-        chapter.title = POSTED_AGO.sub("", text).strip()
+    def parse_chapter_title(self, soup: PageSoup, chapter: Chapter):
+        chapter.title = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-import logging
+"""Crawler for novelfull.com and novelfull.net."""
 
+from urllib.parse import quote_plus
+
+from lncrawl.core import SearchResult
 from lncrawl.templates.novelfull import NovelFullTemplate
-
-logger = logging.getLogger(__name__)
 
 
 class NovelFullCrawler(NovelFullTemplate):
@@ -14,10 +15,19 @@ class NovelFullCrawler(NovelFullTemplate):
         "https://novelfull.net/",
     ]
 
-    def initialize(self) -> None:
+    def initialize(self):
         self.cleaner.bad_css.update(
-            [
-                'div[align="left"]',
-                'img[src*="proxy?container=focus"]',
-            ]
+            ['div[align="left"]', 'img[src*="proxy?container=focus"]']
         )
+
+    def search_novel(self, query):
+        url = f"{self.scraper.origin.rstrip('/')}/search?keyword={quote_plus(query)}"
+        soup = self.get_soup(url)
+        seen = set()
+        for link in soup.select('.fwn-rank-list .li-row h3.tit a[href]'):
+            href = link.get("href", "").split("#", 1)[0]
+            title = link.get("title") or link.get_text(" ", strip=True)
+            if not href or not title or href in seen:
+                continue
+            seen.add(href)
+            yield SearchResult(title=title, url=self.absolute_url(href))
