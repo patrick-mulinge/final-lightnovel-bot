@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class SonicMTLCrawler(MadaraTemplate):
+    can_search = True
     has_mtl = True
     base_url = [
         "https://sonicmtl.com",

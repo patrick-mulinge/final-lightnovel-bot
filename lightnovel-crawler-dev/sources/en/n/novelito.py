@@ -1,14 +1,29 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Crawler for Novelito public novel and chapter APIs."""
 
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 
 class NovelitoCrawler(LegacyCrawler):
     base_url = ["https://noveli.to/"]
+    can_search = True
+
+    def search_novel(self, query):
+        data = self.get_json(
+            f"{self.scraper.origin.rstrip('/')}/api/novels?search={quote(query)}&sort=popular&page=1&limit=36"
+        )
+        for item in data.get("data", []):
+            slug = item.get("slug")
+            if not slug:
+                continue
+            yield {
+                "title": item.get("title") or slug,
+                "url": f"{self.scraper.origin.rstrip('/')}/novel/{slug}",
+                "info": f"{item.get('status', '')} | {item.get('chapter_count', 0)} chapters".strip(" |"),
+            }
     browser_user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "

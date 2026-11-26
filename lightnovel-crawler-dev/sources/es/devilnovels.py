@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Crawler for Devil Novels."""
 
 import re
@@ -8,6 +8,28 @@ from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 class DevilNovelsCrawler(LegacyCrawler):
     base_url = ["https://devilnovels.com/"]
+    can_search = True
+
+    def search_novel(self, query):
+        response = self.post_response(
+            self.ajax_url,
+            data={"action": "dv_live_search", "q": query},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer": self.base_url[0],
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            return
+        for item in ((data.get("data") or {}).get("results") or []):
+            url = item.get("url")
+            if url:
+                yield {"title": item.get("title") or "", "url": url, "info": ""}
+
     ajax_url = "https://devilnovels.com/wp-admin/admin-ajax.php"
 
     def read_novel_info(self):

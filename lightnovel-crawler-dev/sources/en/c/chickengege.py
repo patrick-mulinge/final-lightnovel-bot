@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 import logging
 
-from lncrawl.core import Chapter, PageSoup, SoupTemplate
+from lncrawl.core import SearchResult, Chapter, PageSoup, SoupTemplate
 
 logger = logging.getLogger(__name__)
 
 
 class ChickenGegeCrawler(SoupTemplate):
+    def search_novel(self, query):
+        soup = self.get_soup(f"{self.scraper.origin.rstrip('/')}/?s={quote(query)}&post_type=any")
+        seen = set()
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").split("#", 1)[0]
+            title = link.get_text(" ", strip=True)
+            if href and title and href not in seen and any(x in href for x in ("/novel/", "/book/", "/story/")):
+                seen.add(href)
+                yield SearchResult(title=title, url=self.absolute_url(href))
+    can_search = True
     base_url = ["https://www.chickengege.org/"]
 
     novel_title_selector = "h1.entry-title"

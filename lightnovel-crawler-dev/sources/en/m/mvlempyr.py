@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 from lncrawl.core import Novel, PageSoup, SoupTemplate
 
@@ -16,6 +17,15 @@ class MVLEmpyrCrawler(SoupTemplate):
         "https://www.mvlempyr.io/",
         "https://www.mvlempyr.com/",
     ]
+
+    can_search = True
+    search_item_list_selector = "article, .novel-item, .novel-card, .book-item"
+    search_item_title_selector = ".novel-title, .book-title, h2, h3, a[href*='/novel/']"
+    search_item_url_selector = "a[href*='/novel/'], a[href*='/book/']"
+    search_item_info_selector = ".synopsis, .description, .summary"
+
+    def build_search_url(self, query: str) -> str:
+        return f"{self.scraper.origin.rstrip('/')}/?s={quote(query)}"
 
     novel_title_selector = ".novel-title"
     novel_cover_selector = "img.novel-image2"

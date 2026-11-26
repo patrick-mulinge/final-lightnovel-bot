@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class Novel543(LegacyCrawler):
+    can_search = True
     base_url = ["https://www.novel543.com/"]
     has_manga = False
     has_mtl = False

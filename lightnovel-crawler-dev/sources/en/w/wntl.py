@@ -1,12 +1,25 @@
-﻿# -*- coding: utf-8 -*-
+from urllib.parse import quote
+# -*- coding: utf-8 -*-
 """Crawler for WNTL (wntl.net)."""
 
 from html import escape
 
-from lncrawl.core import Chapter, LegacyCrawler, Volume
+from lncrawl.core import SearchResult, Chapter, LegacyCrawler, Volume
 
 
 class WntlCrawler(LegacyCrawler):
+    def search_novel(self, query):
+        data = self.get_json(f"{self.scraper.origin.rstrip('/')}/api/novels")
+        needle = query.casefold().strip()
+        for item in data.get("novels", []):
+            title = str(item.get("title", ""))
+            alternates = " ".join(map(str, item.get("alternate-title", [])))
+            if needle not in f"{title} {alternates}".casefold():
+                continue
+            novel_id = item.get("id")
+            if novel_id:
+                yield SearchResult(title=title, url=f"{self.scraper.origin.rstrip('/')}/novel/{novel_id}")
+    can_search = True
     base_url = ["https://wntl.net/"]
 
     def _novel_id(self):

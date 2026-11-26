@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class MtlnovelCrawler(LegacyCrawler):
+    can_search = True
     has_mtl = True
     base_url = [
         "https://mtlnovel.me/",

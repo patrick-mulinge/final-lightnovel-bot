@@ -1,13 +1,27 @@
 # -*- coding: utf-8 -*-
 """Crawler for Dragonholic Translations."""
 
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 
 class DragonholicTranslationsCrawler(LegacyCrawler):
     base_url = ["https://dragonholictranslations.com/"]
+    can_search = True
+
+    def search_novel(self, query):
+        data = self.get_json(
+            f"{self.scraper.origin.rstrip('/')}/api/search?q={quote(query)}&per_page=50&types[]=series"
+        )
+        for item in data.get("results", []):
+            url = item.get("url")
+            if url:
+                yield {
+                    "title": item.get("title") or "",
+                    "url": url,
+                    "info": item.get("excerpt") or "",
+                }
     api_url = "https://dragonholictranslations.com/api/chapters"
 
     def _headers(self, referer):

@@ -9,6 +9,7 @@ search_url = "%s/wp-admin/admin-ajax.php?action=autosuggest&q=%s"
 
 
 class MtlnovelCrawler(LegacyCrawler):
+    can_search = True
     has_mtl = True
     base_url = [
         "https://www.mtlnovel.com/",

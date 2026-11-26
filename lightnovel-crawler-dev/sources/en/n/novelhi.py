@@ -15,6 +15,7 @@ fetch_chapter_body_url = "%s/book/queryBookIndexContent?bookId=%s&bookIndexId=%s
 
 
 class NovelHiCrawler(LegacyCrawler):
+    can_search = True
     base_url = ["https://novelhi.com/"]
 
     def search_novel(self, query):

@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class NoveLightCrawler(SoupTemplate):
+    can_search = True
     base_url = "https://novelight.net/"
 
     search_item_list_selector = ".manga-grid-list a.item"

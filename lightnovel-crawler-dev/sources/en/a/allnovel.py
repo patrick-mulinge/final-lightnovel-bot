@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class AllNovelCrawler(NovelFullTemplate):
+    can_search = True
     base_url = ["https://allnovel.org/", "https://www.allnovel.org/", "https://allnovelxo.com/"]
 
     def initialize(self) -> None:

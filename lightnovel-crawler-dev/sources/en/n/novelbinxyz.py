@@ -1,20 +1,41 @@
 # -*- coding: utf-8 -*-
 """Crawler for Novelbin.xyz."""
 
+import base64
+import json
 from urllib.parse import urlparse
 
-from lncrawl.core import Chapter, LegacyCrawler, Volume
-
+from lncrawl.core import Chapter, LegacyCrawler, SearchResult, Volume
 
 class NovelbinxyzCrawler(LegacyCrawler):
     base_url = ["https://novelbin.xyz/"]
     cdn_url = "https://boxnovela.b-cdn.net"
+    can_search = True
+
+    def search_novel(self, query):
+        response = self.get_response(
+            f"{self.cdn_url}/lists/web_search.json",
+            headers=self._headers(),
+        )
+        try:
+            items = json.loads(base64.b64decode(response.text).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            items = []
+        query = query.casefold()
+        for item in items:
+            title = item.get("title", "")
+            alternatives = item.get("alternative_titles", "")
+            if query not in f"{title} {alternatives}".casefold():
+                continue
+            slug = item.get("slug")
+            if slug:
+                yield SearchResult(title=title, url=f"{self.scraper.origin.rstrip('/')}/novel/{slug}")
 
     def _headers(self):
         return {
             "Accept": "application/json, text/plain, */*",
             "Origin": "https://novelbin.xyz",
-            "Referer": self.novel_url,
+            "Referer": getattr(self, "novel_url", self.base_url[0]),
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "

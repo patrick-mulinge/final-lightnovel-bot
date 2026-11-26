@@ -3,6 +3,7 @@ from lncrawl.templates.novelmtl import NovelMTLTemplate
 
 
 class FanMTLCrawler(NovelMTLTemplate):
+    can_search = True
     has_mtl = True
     base_url = [
         "https://www.fanmtl.com/",

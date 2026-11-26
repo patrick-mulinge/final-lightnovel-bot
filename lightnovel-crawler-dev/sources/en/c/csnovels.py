@@ -1,16 +1,31 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Crawler for CS Novels book and chapter pages."""
 
 import json
 from html import escape
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
-from lncrawl.core import Chapter, LegacyCrawler, Volume
+from lncrawl.core import Chapter, LegacyCrawler, SearchResult, Volume
 
 
 class CsnovelsCrawler(LegacyCrawler):
     base_url = ["https://csnovels.com/"]
+    can_search = True
+
+    def search_novel(self, query):
+        data = self.get_json(
+            f"{self.scraper.origin.rstrip('/')}/searchbook?query={quote(query)}"
+        )
+        for item in data.get("data", []):
+            slug = item.get("slug")
+            if not slug:
+                continue
+            yield SearchResult(
+                title=item.get("title") or slug.replace("-", " ").title(),
+                url=f"{self.scraper.origin.rstrip('/')}/book/{slug}",
+                info=item.get("status") or "",
+            )
 
     def read_novel_info(self):
         self.novel_title = re.sub(r"[-_]+", " ", self.novel_url.rstrip("/").rsplit("/", 1)[-1]).title()

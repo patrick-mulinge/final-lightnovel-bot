@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class NovelHallCrawler(LegacyCrawler):
+    can_search = True
     base_url = [
         "https://www.novelhall.com/",
     ]

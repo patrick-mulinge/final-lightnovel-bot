@@ -54,55 +54,6 @@ RUN --mount=type=cache,target=/var/cache/novelbot \
     tar -xJf "$archive" -C /opt && \
     ln -sf /opt/firefox/firefox /usr/local/bin/firefox
 
-# ---------------------------------------------------------------------------
-# Calibre (ebook-convert) for PDF / MOBI / AZW3 / KEPUB / DOCX / RTF / FB2 / HTMLZ.
-# Kept ABOVE the crawler COPY so editing lightnovel-crawler-dev or main.py never
-# reinstalls it. Official installer only: Debian's calibre package is old/broken.
-# Runs headless: QT_QPA_PLATFORM=offscreen is required for PDF (Qt WebEngine).
-# ---------------------------------------------------------------------------
-ENV QT_QPA_PLATFORM=offscreen \
-    QTWEBENGINE_DISABLE_SANDBOX=1 \
-    QTWEBENGINE_CHROMIUM_FLAGS="--no-sandbox"
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        libopengl0 \
-        libegl1 \
-        libgl1 \
-        libxkbcommon0 \
-        libxkbcommon-x11-0 \
-        libxkbfile1 \
-        libxcb-cursor0 \
-        libxcb-icccm4 \
-        libxcb-image0 \
-        libxcb-keysyms1 \
-        libxcb-randr0 \
-        libxcb-render-util0 \
-        libxcb-shape0 \
-        libxcb-xinerama0 \
-        libxcb-xkb1 \
-        libnss3 \
-        libxcomposite1 \
-        libxdamage1 \
-        libxrandr2 \
-        libxi6 \
-        libgbm1 \
-        libxshmfence1 \
-        libglib2.0-0 \
-        libfontconfig1 \
-        libdbus-1-3 && \
-    rm -rf /var/lib/apt/lists/*
-
-# Official installer (amd64 + arm64). Installs to /opt/calibre; the symlink makes
-# `ebook-convert` visible on PATH for lncrawl's shutil.which("ebook-convert").
-# --version at the end fails the build early if the install is broken.
-RUN wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh | sh /dev/stdin && \
-    ln -sf /opt/calibre/ebook-convert /usr/local/bin/ebook-convert && \
-    command -v ebook-convert && \
-    ebook-convert --version
-
 # Changes here rebuild the crawler installation layer.
 COPY lightnovel-crawler-dev/ /app/lncrawl-src/
 

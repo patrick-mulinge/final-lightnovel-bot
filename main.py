@@ -916,15 +916,13 @@ def _reply_prompt_timeout(chat_id, token, delay):
     state = pending_reply_states.get(chat_id)
     if not state or state["token"] != token:
         return
-
     user_id = state["user_id"]
     _clear_timed_reply(chat_id, user_id)
     send_temp_message(
         chat_id,
-        "⌛ This request expired after 10 minutes. Send the command again when you are ready.",
+        "This request has ended. Send the command again when you are ready.",
         user_id,
     )
-
 
 def register_timed_next_step(chat_id, user_id, handler, kind, *args, timeout=REPLY_PROMPT_TIMEOUT_SECONDS):
     """Replace any older text reply prompt in this chat and expire this one safely."""
@@ -1440,16 +1438,8 @@ def _crawl_v4_with_progress_impl(
 # key -> (button label, native?)  native = built by lncrawl itself, no Calibre.
 # Everything else is converted from the EPUB by Calibre's ebook-convert.
 OUTPUT_FORMATS = {
-    "epub":  ("📚 EPUB",  True),
-    "txt":   ("📃 Text (zip)", True),
-    "pdf":   ("📄 PDF",   False),
-    "azw3":  ("🔳 AZW3 (Kindle)", False),
-    "mobi":  ("🔲 MOBI (old Kindle)", False),
-    "kepub": ("📓 KEPUB (Kobo)", False),
-    "docx":  ("📝 DOCX (Word)", False),
-    "rtf":   ("📑 RTF", False),
-    "fb2":   ("📔 FB2", False),
-    "htmlz": ("🌐 HTMLZ", False),
+    "epub": ("EPUB", True),
+    "txt":  ("Text", True),
 }
 DEFAULT_OUTPUT_FORMAT = "epub"
 FORMAT_SESSION_SECONDS = 600
@@ -1471,22 +1461,13 @@ def split_artifact_name(name):
     return root, ext
 
 def format_picker_markup(show_all=False):
-    kb = telebot.types.InlineKeyboardMarkup()
-    if not show_all:
-        kb.row(
-            telebot.types.InlineKeyboardButton("📚 EPUB", callback_data="fmt_epub"),
-            telebot.types.InlineKeyboardButton("📃 Text", callback_data="fmt_txt"),
-            telebot.types.InlineKeyboardButton("➕ Other", callback_data="fmt_other"),
-        )
-        return kb
-    buttons = [
-        telebot.types.InlineKeyboardButton(label, callback_data=f"fmt_{key}")
-        for key, (label, _native) in OUTPUT_FORMATS.items()
-    ]
-    for i in range(0, len(buttons), 2):
-        kb.row(*buttons[i:i + 2])
-    kb.row(telebot.types.InlineKeyboardButton("⬅ Back", callback_data="fmt_back"))
-    return kb
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("EPUB", callback_data="fmt_epub"),
+        telebot.types.InlineKeyboardButton("Text", callback_data="fmt_txt"),
+    )
+    return markup
+
 
 # ---------------------- SPLIT SIZES (chapters per converted file) ----------------------
 # Calibre formats are converted in parts of N chapters: each part is a small, fast
@@ -1685,15 +1666,15 @@ def crawl_v3_with_progress(url, chapter_range, on_progress, cancel_event, on_ima
 
 skip_scan_events = {}  # preview_id -> threading.Event
 
-def prompt_manual_range(message, chat_id, user_id, url, version):
+def prompt_manual_range(message, chat_id, user_id, url, version, requester=None):
     version = force_v4(version)
     pending_urls[user_id] = {
-    "url": url,
-    "title": None,
-    "total_chapters": None,
-    "version": version,
-}
-    start_range_timeout(message.from_user, chat_id, url, version, None, None)
+        "url": url,
+        "title": None,
+        "total_chapters": None,
+        "version": version,
+    }
+    start_range_timeout(requester or message.from_user, chat_id, url, version, None, None)
     ask_v4_range(chat_id, user_id)
 
 def request_preview(url, version, user_id, chat_id, username=None, first_name=None, last_name=None):
@@ -1735,24 +1716,17 @@ def _range_timeout_watcher(user_id, token, delay):
     time.sleep(delay)
     state = pending_range_state.get(user_id)
     if not state or state["token"] != token:
-        return  # user already responded, or a newer request superseded this one
+        return
     pending_range_state.pop(user_id, None)
-
     try:
         bot.clear_step_handler_by_chat_id(state["chat_id"])
     except Exception:
         pass
     pending_urls.pop(user_id, None)
-
-    send_task_message(
+    send_temp_message(
         state["chat_id"],
-        f"⏰ No response for 10 minutes — automatically queuing the full novel (All chapters).",
-        user_id
-    )
-    insert_task_direct(
-        state["chat_id"], state["url"], "all", state["version"],
-        state["user_id"], state["username"], state["first_name"], state["last_name"],
-        novel_title=state["title"], total_chapters=state["total_chapters"]
+        "This request has ended. Send /download to start again.",
+        user_id,
     )
 
 def wait_for_preview(pid, timeout=7200, cancel_event=None):
@@ -3645,76 +3619,178 @@ if SERVER_ID == "s4":
     # ---------------------- DOWNLOAD COMMAND ----------------------
 
     # ---------------------- /search ----------------------
-    SEARCH_LIMIT = 10          # same defaults as `lncrawl search`
+    SEARCH_LIMIT = 10
     SEARCH_CONCURRENCY = 15
-    SEARCH_TIMEOUT = 30
-    search_lock = threading.Semaphore(2)  # at most 2 searches at once on this worker
+    SEARCH_TIMEOUT = 60
+    SEARCH_PAGE_SIZE = 5
+    SEARCH_SESSION_SECONDS = 600
+    search_lock = threading.Semaphore(2)
+    search_sessions = {}
+    active_search_sessions = {}
+    search_session_lock = threading.Lock()
 
     def run_lncrawl_search(query):
-        """Same search `lncrawl search "<query>"` runs: every source with can_search=True."""
+        """Run the same source search used by the lncrawl CLI."""
         ctx, _ = _v4()
         ctx.setup()
         ctx.sources.ensure_load()
         from lncrawl.commands.search.helper import perform_search
-
         sources = ctx.sources.list(None, can_search=True, include_rejected=False)
         if not sources:
             raise Exception("No searchable sources available")
-        results = perform_search(
+        return perform_search(
             query=query,
             sources=sources,
             concurrency=SEARCH_CONCURRENCY,
             limit=SEARCH_LIMIT,
             timeout=SEARCH_TIMEOUT,
+        ), len(sources)
+
+    def _search_key(chat_id, user_id):
+        return chat_id, user_id
+
+    def _close_search_session(token, delete_message=False):
+        with search_session_lock:
+            session = search_sessions.pop(token, None)
+            if session and active_search_sessions.get(_search_key(session["chat_id"], session["user_id"])) == token:
+                active_search_sessions.pop(_search_key(session["chat_id"], session["user_id"]), None)
+        if delete_message and session and session.get("message_id"):
+            try:
+                bot.delete_message(session["chat_id"], session["message_id"])
+            except Exception:
+                pass
+        return session
+
+    def _expire_search_session(token):
+        time.sleep(SEARCH_SESSION_SECONDS)
+        _close_search_session(token, delete_message=True)
+
+    def _search_callback_data(token, action, value=""):
+        return f"search:{token}:{action}:{value}"
+
+    def _search_session(token, call):
+        with search_session_lock:
+            session = search_sessions.get(token)
+        if not session or session["expires"] <= time.time():
+            _close_search_session(token, delete_message=True)
+            bot.answer_callback_query(call.id, "This session has ended. Search again.")
+            return None
+        if session["chat_id"] != call.message.chat.id or session["user_id"] != call.from_user.id:
+            bot.answer_callback_query(call.id, "This search belongs to another user.")
+            return None
+        return session
+
+    def _search_markup(session, view, index=None):
+        token = session["token"]
+        markup = telebot.types.InlineKeyboardMarkup()
+        if view == "list":
+            page = session["page"]
+            start = page * SEARCH_PAGE_SIZE
+            for result_index, result in enumerate(session["results"][start:start + SEARCH_PAGE_SIZE], start=start):
+                label = f"{result_index + 1}. {result.title}"[:60]
+                markup.add(telebot.types.InlineKeyboardButton(
+                    label,
+                    callback_data=_search_callback_data(token, "title", result_index),
+                ))
+            pages = max(1, (len(session["results"]) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+            controls = []
+            if page:
+                controls.append(telebot.types.InlineKeyboardButton("Back", callback_data=_search_callback_data(token, "page", page - 1)))
+            controls.append(telebot.types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=_search_callback_data(token, "noop")))
+            if page + 1 < pages:
+                controls.append(telebot.types.InlineKeyboardButton("Next", callback_data=_search_callback_data(token, "page", page + 1)))
+            markup.row(*controls)
+        elif view == "sources":
+            result = session["results"][index]
+            for source_index, novel in enumerate(result.novels):
+                label = f"{source_index + 1}. {novel.url}"[:60]
+                markup.add(telebot.types.InlineKeyboardButton(
+                    label,
+                    callback_data=_search_callback_data(token, "source", f"{index}-{source_index}"),
+                ))
+            markup.row(telebot.types.InlineKeyboardButton("Back", callback_data=_search_callback_data(token, "list")))
+        else:
+            markup.row(
+                telebot.types.InlineKeyboardButton("Yes", callback_data=_search_callback_data(token, "yes", index)),
+                telebot.types.InlineKeyboardButton("Back", callback_data=_search_callback_data(token, "sources", index)),
+            )
+        markup.row(telebot.types.InlineKeyboardButton("Cancel", callback_data=_search_callback_data(token, "cancel")))
+        return markup
+
+    def _search_edit(session, text, markup):
+        try:
+            if session.get("message_id"):
+                bot.edit_message_text(
+                    text,
+                    session["chat_id"],
+                    session["message_id"],
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    link_preview_options=telebot.types.LinkPreviewOptions(is_disabled=True),
+                )
+                return
+        except Exception:
+            pass
+        try:
+            sent = bot.send_message(
+                session["chat_id"],
+                text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                link_preview_options=telebot.types.LinkPreviewOptions(is_disabled=True),
+            )
+            session["message_id"] = sent.message_id
+        except Exception as error:
+            print(f"[SEARCH MESSAGE ERROR] {error}")
+
+    def _render_search_list(session):
+        page = session["page"]
+        start = page * SEARCH_PAGE_SIZE
+        entries = []
+        for result_index, result in enumerate(session["results"][start:start + SEARCH_PAGE_SIZE], start=start + 1):
+            entries.append(f"<b>{result_index}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))")
+        text = "<b>Here are the novels I found for your query:</b>\n\n" + "\n\n".join(entries)
+        _search_edit(session, text, _search_markup(session, "list"))
+
+    def _render_search_sources(session, result_index):
+        result = session["results"][result_index]
+        lines = [f"<b>{result_index + 1}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))"]
+        for source_index, novel in enumerate(result.novels, start=1):
+            lines.append(f"\n{source_index}. {html.escape(novel.url)}")
+            info = (novel.info or "").strip()
+            if info:
+                lines.append(f"<i>{html.escape(info[:500])}</i>")
+        _search_edit(session, "\n".join(lines), _search_markup(session, "sources", result_index))
+
+    def _render_search_confirm(session, result_index, source_index):
+        result = session["results"][result_index]
+        novel = result.novels[source_index]
+        session["selection"] = (result_index, source_index)
+        text = (
+            "<b>Download this novel?</b>\n\n"
+            f"{html.escape(result.title)}\n"
+            f"{html.escape(novel.url)}"
         )
-        return results, len(sources)
+        _search_edit(session, text, _search_markup(session, "confirm", result_index))
 
-    def format_search_results(results):
-        """One HTML block per novel: title, source count, then each url + info."""
-        blocks = []
-        for number, result in enumerate(results, start=1):
-            lines = [f"📖 <b>{number}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))"]
-            for novel in result.novels:
-                lines.append(f"➡️ {html.escape(novel.url)}")
-                info = (novel.info or "").strip()
-                if info:
-                    lines.append(f"    <i>{html.escape(info[:300])}</i>")
-            blocks.append("\n".join(lines))
-        return blocks
+    def _start_search(chat_id, user_id, query, mode="search"):
+        key = _search_key(chat_id, user_id)
+        token = uuid.uuid4().hex[:12]
+        with search_session_lock:
+            old_token = active_search_sessions.get(key)
+            if old_token:
+                search_sessions.pop(old_token, None)
+            active_search_sessions[key] = token
+        threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token), daemon=True).start()
 
-    def pack_blocks(blocks, limit=TELEGRAM_MAX_LEN):
-        """Join blocks into messages under Telegram's limit; split a block only if it alone is too long."""
-        messages, current = [], ""
-        for block in blocks:
-            pieces = [block]
-            if len(block) > limit:
-                pieces, part = [], ""
-                for line in block.split("\n"):
-                    if part and len(part) + len(line) + 1 > limit:
-                        pieces.append(part)
-                        part = ""
-                    part = f"{part}\n{line}" if part else line[:limit]
-                if part:
-                    pieces.append(part)
-            for piece in pieces:
-                if current and len(current) + len(piece) + 2 > limit:
-                    messages.append(current)
-                    current = ""
-                current = f"{current}\n\n{piece}" if current else piece
-        if current:
-            messages.append(current)
-        return messages
-
-    def _search_worker(chat_id, user_id, query):
-        searching_msg = safe_send_message(
-            chat_id, f"🔍 Searching for “{query}”...\nThis can take up to 30-60 seconds."
-        )
+    def _search_worker(chat_id, user_id, query, mode, token):
+        searching_msg = safe_send_message(chat_id, f"Searching for {query}...")
         try:
             with search_lock:
                 results, source_count = run_lncrawl_search(query)
-        except Exception as e:
-            print(f"[SEARCH ERROR] user={user_id} query={query!r}: {type(e).__name__}: {e}")
-            send_temp_message(chat_id, f"⚠️ Search failed: {type(e).__name__}: {e}", user_id)
+        except Exception as error:
+            print(f"[SEARCH ERROR] user={user_id} query={query!r}: {type(error).__name__}: {error}")
+            send_temp_message(chat_id, f"Search failed: {type(error).__name__}: {error}", user_id)
             return
         finally:
             if searching_msg:
@@ -3722,59 +3798,106 @@ if SERVER_ID == "s4":
                     bot.delete_message(chat_id, searching_msg.message_id)
                 except Exception:
                     pass
-
+        with search_session_lock:
+            if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
+                return
+            if not results:
+                active_search_sessions.pop(_search_key(chat_id, user_id), None)
         print(f"[SEARCH] user={user_id} query={query!r} -> {len(results)} result(s) from {source_count} sources")
         if not results:
-            send_temp_message(
-                chat_id,
-                f"😕 No results found for “{query}”.\nTry a shorter or different name.",
-                user_id,
-            )
+            send_temp_message(chat_id, f"No results found for {query}.\nTry a shorter or different name.", user_id)
             return
-
-        # Results stay in the chat (not auto-deleted) so the user can copy a link.
-        for text in pack_blocks(format_search_results(results)):
-            safe_send_message(chat_id, text, parse_mode="HTML")
-        safe_send_message(
-            chat_id,
-            "✅ Copy a link above, send /download and paste it to download that novel.",
-        )
+        session = {
+            "token": token,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "query": query,
+            "mode": mode,
+            "results": results,
+            "page": 0,
+            "expires": time.time() + SEARCH_SESSION_SECONDS,
+            "message_id": None,
+        }
+        with search_session_lock:
+            search_sessions[token] = session
+        _render_search_list(session)
+        threading.Thread(target=_expire_search_session, args=(token,), daemon=True).start()
 
     def get_search_query(message):
         user_responded(message.from_user.id)
         user_id = message.from_user.id
         chat_id = message.chat.id
         _complete_timed_reply(chat_id, user_id)
-
         query = (message.text or "").strip()
         if message.text and query.startswith("/"):
-            send_temp_message(chat_id, "ℹ️ Search cancelled. Send /search again with a novel name.", user_id)
+            send_temp_message(chat_id, "Search cancelled. Send /search again with a novel name.", user_id)
             return
         if len(query) < 2:
-            send_temp_message(chat_id, "❌ The name must be at least 2 characters. Send /search to try again.", user_id)
+            send_temp_message(chat_id, "The name must be at least 2 characters. Send /search to try again.", user_id)
             return
-        threading.Thread(target=_search_worker, args=(chat_id, user_id, query), daemon=True).start()
+        _start_search(chat_id, user_id, query)
 
     @bot.message_handler(commands=['search'])
     def search_novels(message):
         user_id = message.from_user.id
-        send_prompt(message.chat.id, "🔍 Enter the novel name to search for:", user_id)
+        send_prompt(message.chat.id, "Enter the novel name to search for:", user_id)
         register_timed_next_step(message.chat.id, user_id, get_search_query, "search")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("search:"))
+    def handle_search_selection(call):
+        try:
+            _prefix, token, action, value = call.data.split(":", 3)
+        except ValueError:
+            bot.answer_callback_query(call.id, "Invalid search selection.")
+            return
+        session = _search_session(token, call)
+        if not session:
+            return
+        if action == "noop":
+            bot.answer_callback_query(call.id)
+            return
+        if action == "cancel":
+            _close_search_session(token, delete_message=True)
+            bot.answer_callback_query(call.id, "Search cancelled.")
+            return
+        if action == "page":
+            session["page"] = max(0, min(int(value), (len(session["results"]) - 1) // SEARCH_PAGE_SIZE))
+            _render_search_list(session)
+        elif action == "list":
+            _render_search_list(session)
+        elif action == "title":
+            _render_search_sources(session, int(value))
+        elif action == "source":
+            result_index, source_index = map(int, value.split("-", 1))
+            _render_search_confirm(session, result_index, source_index)
+        elif action == "sources":
+            _render_search_sources(session, int(value))
+        elif action == "yes":
+            selected = session.get("selection")
+            if not selected:
+                bot.answer_callback_query(call.id, "Choose a source first.")
+                return
+            result_index, source_index = selected
+            novel = session["results"][result_index].novels[source_index]
+            _close_search_session(token)
+            try:
+                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id, "Starting scan...")
+            _start_url_scan(call.message, novel.url, "v4", call.from_user)
+            return
+        else:
+            bot.answer_callback_query(call.id, "Invalid search selection.")
+            return
+        bot.answer_callback_query(call.id)
 
     @bot.message_handler(commands=['download'])
     def download(message):
         user_id = message.from_user.id
-        # v3 is retired: no version picker, everything goes to v4.
-        send_prompt(message.chat.id, "📌 Enter novel URL:", user_id)
-        register_timed_next_step(
-            message.chat.id,
-            user_id,
-            get_url,
-            "url",
-            "v4",
-        )
+        send_prompt(message.chat.id, "Enter a novel URL or title:", user_id)
+        register_timed_next_step(message.chat.id, user_id, get_url, "url", "v4")
 
-        
     def get_version(message):
         version = force_v4(message.text.strip())
 
@@ -3999,22 +4122,8 @@ if SERVER_ID == "s4":
             bot.answer_callback_query(call.id, "❌ Session expired. Send /download again.")
             return
 
-        # "Other" shows every format; "Back" returns to the three buttons.
-        if choice in ("other", "back"):
-            try:
-                bot.edit_message_text(
-                    "📦 Pick a format:" if choice == "other" else "📦 Which file format do you want?",
-                    chat_id,
-                    call.message.message_id,
-                    reply_markup=format_picker_markup(show_all=(choice == "other")),
-                )
-            except Exception as e:
-                print(f"[FORMAT PICKER EDIT] {e}")
-            bot.answer_callback_query(call.id)
-            return
-
         if choice not in OUTPUT_FORMATS:
-            bot.answer_callback_query(call.id, "Unknown format.")
+            bot.answer_callback_query(call.id, "Only EPUB and Text are available.")
             return
 
         pending_format_state.pop(user_id, None)
@@ -4048,10 +4157,22 @@ if SERVER_ID == "s4":
 
     def get_url(message, version):
         user_responded(message.from_user.id)
-        url = message.text.strip()
+        value = (message.text or "").strip()
         user_id = message.from_user.id
         chat_id = message.chat.id
         _complete_timed_reply(chat_id, user_id)
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            if len(value) < 2:
+                send_temp_message(chat_id, "? Enter a valid URL or a novel name with at least 2 characters.", user_id)
+                return
+            _start_search(chat_id, user_id, value, mode="download")
+            return
+        _start_url_scan(message, value, version, message.from_user)
+
+    def _start_url_scan(message, url, version, requester):
+        user_id = requester.id
+        chat_id = message.chat.id
 
         banned_site = find_banned_site(url)
         if banned_site:
@@ -4068,9 +4189,9 @@ if SERVER_ID == "s4":
 
         pid = request_preview(
             url, version, user_id, chat_id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name
+            username=requester.username,
+            first_name=requester.first_name,
+            last_name=requester.last_name
         )
         if pid is None:
             send_temp_message(chat_id, "❌ Database error, please try again.", user_id)
@@ -4089,11 +4210,11 @@ if SERVER_ID == "s4":
 
         threading.Thread(
             target=_await_preview_and_prompt_range,
-            args=(message, url, version, user_id, chat_id, pid, scan_cancel_event, scanning_msg),
+            args=(message, url, version, requester, user_id, chat_id, pid, scan_cancel_event, scanning_msg),
             daemon=True
         ).start()
 
-    def _await_preview_and_prompt_range(message, url, version, user_id, chat_id, pid, scan_cancel_event, scanning_msg):
+    def _await_preview_and_prompt_range(message, url, version, requester, user_id, chat_id, pid, scan_cancel_event, scanning_msg):
         row = wait_for_preview(pid, cancel_event=scan_cancel_event, timeout=7200)
         skip_scan_events.pop(pid, None)
 
@@ -4102,7 +4223,7 @@ if SERVER_ID == "s4":
                 edit_and_autodelete(chat_id, scanning_msg.message_id, "⏭ Skipping scan — enter the chapter range manually.")
             except Exception:
                 pass
-            prompt_manual_range(message, chat_id, user_id, url, version)
+            prompt_manual_range(message, chat_id, user_id, url, version, requester=requester)
             return
 
         if row['status'] == 'failed':
@@ -4127,7 +4248,7 @@ if SERVER_ID == "s4":
     "total_chapters": row["chapter_count"],
     "version": version,
 }
-        start_range_timeout(message.from_user, chat_id, url, version, row['title'], row['chapter_count'])
+        start_range_timeout(requester, chat_id, url, version, row['title'], row['chapter_count'])
 
         ask_v4_range(chat_id, user_id)
 

@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class FenriRealm(LegacyCrawler):
+    can_search = True
     base_url = [
         "https://fenrirealm.com/",
     ]

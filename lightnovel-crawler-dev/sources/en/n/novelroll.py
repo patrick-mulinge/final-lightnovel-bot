@@ -1,13 +1,50 @@
-﻿# -*- coding: utf-8 -*-
+from urllib.parse import quote
+# -*- coding: utf-8 -*-
 """Crawler for novelroll.com."""
 
 import json
 import re
 
-from lncrawl.core import Chapter, LegacyCrawler, Volume
+from bs4 import BeautifulSoup
+
+from lncrawl.core import SearchResult, Chapter, LegacyCrawler, Volume
 
 
 class NovelrollCrawler(LegacyCrawler):
+    def search_novel(self, query):
+        page = self.get_soup(self.scraper.origin.rstrip("/") + "/")
+        component = page.select_one('[wire\:name="header.search"][wire\:id]')
+        if not component:
+            return
+        snapshot = component.get("wire:snapshot")
+        component_id = component.get("wire:id")
+        if not snapshot or not component_id:
+            return
+        payload = {
+            "_token": (page.select_one("meta[name=csrf-token]") or {}).get("content", ""),
+            "components": [{
+                "snapshot": snapshot,
+                "updates": {"search": query},
+                "calls": [{"method": "$commit", "params": [], "metadata": {"type": "model.live"}}],
+            }],
+        }
+        response = self.post_response(
+            self.scraper.origin.rstrip("/") + "/livewire-5cdd1b42/update",
+            json=payload,
+            headers={"X-Livewire": "1", "X-Requested-With": "XMLHttpRequest"},
+        ).json()
+        html = ""
+        for item in response.get("components", []):
+            html += (item.get("effects") or {}).get("html", "")
+        results = BeautifulSoup(html, "html.parser")
+        seen = set()
+        for link in results.select('a[href]'):
+            href = link.get("href", "")
+            title = link.get_text(" ", strip=True)
+            if href and title and href not in seen and ("/novel/" in href or "/series/" in href):
+                seen.add(href)
+                yield SearchResult(title=title, url=self.absolute_url(href))
+    can_search = True
     base_url = ["https://novelroll.com/"]
 
     def _json_ld_book(self, soup):

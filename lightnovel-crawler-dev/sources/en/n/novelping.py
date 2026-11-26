@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 
 
 class NovelPingCrawler(NovelFullTemplate):
+    can_search = True
+
+    def search_novel(self, query):
+        soup = self.get_soup(
+            f"{self.scraper.origin.rstrip('/')}/search?keyword={quote(query)}"
+        )
+        for link in soup.select("a.list-group-item[href], .novel-item a[href], .search-item a[href]"):
+            title = link.get("title") or link.get_text(" ", strip=True)
+            if title and "See more results" not in title:
+                yield {
+                    "title": title.strip(),
+                    "url": self.absolute_url(link["href"]),
+                    "info": "",
+                }
     base_url = [
         "https://novelping.com/",
     ]

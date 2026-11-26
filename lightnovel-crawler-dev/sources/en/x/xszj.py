@@ -2,12 +2,22 @@
 import re
 from typing import Iterable, Optional
 
-from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate, Volume
+from lncrawl.core import SearchResult, Chapter, Novel, PageSoup, SoupTemplate, Volume
 
 CHAPTER_PATH = re.compile(r"^/b/\d+/c/(\d+)$")
 
 
 class XszjCrawler(SoupTemplate):
+    def search_novel(self, query):
+        soup = self.get_soup(f"{self.scraper.origin.rstrip('/')}/?s={quote(query)}&post_type=any")
+        seen = set()
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").split("#", 1)[0]
+            title = link.get_text(" ", strip=True)
+            if href and title and href not in seen and any(x in href for x in ("/novel/", "/book/", "/story/")):
+                seen.add(href)
+                yield SearchResult(title=title, url=self.absolute_url(href))
+    can_search = True
     """Crawler for 小说之家 (xszj.org)."""
 
     base_url = ["https://xszj.org/"]

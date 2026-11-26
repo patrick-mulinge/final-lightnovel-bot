@@ -2,13 +2,33 @@
 """Crawler for Novelib stories and chapters."""
 
 import re
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
+
+from lncrawl.core import SearchResult
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
 
 
 class NovelibCrawler(LegacyCrawler):
     base_url = ["https://novelib.com/"]
+    can_search = True
+
+    def search_novel(self, query):
+        url = f"{self.scraper.origin.rstrip('/')}/?s={quote(query)}&post_type=any"
+        soup = self.get_soup(url)
+        seen = set()
+        for link in soup.select("a[href]"):
+            href = link.get("href", "").split("#", 1)[0]
+            title = link.get_text(" ", strip=True)
+            if not href or not title or href in seen:
+                continue
+            if "/novel/" not in href and "/book/" not in href and "/story/" not in href:
+                continue
+            seen.add(href)
+            yield SearchResult(
+                title=title,
+                url=urljoin(self.scraper.origin, href),
+            )
 
     def initialize(self):
         self.cleaner.bad_tags.update(["script", "style", "nav", "form", "button"])

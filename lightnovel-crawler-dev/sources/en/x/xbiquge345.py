@@ -2,10 +2,18 @@
 import html
 import re
 
-from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate
+from lncrawl.core import SearchResult, Chapter, Novel, PageSoup, SoupTemplate
 
 
 class Xbiquge345Crawler(SoupTemplate):
+    def search_novel(self, query):
+        soup = self.post_soup(self.absolute_url("/waps.php"), data={"s": query, "submit": ""})
+        for link in soup.select("a[href]"):
+            title = link.get_text(" ", strip=True)
+            href = link.get("href", "")
+            if title and href and href not in ("/", "#"):
+                yield SearchResult(title=title, url=self.absolute_url(href))
+    can_search = True
     """Crawler for 笔趣阁小说网 (xbiquge345.com)."""
 
     base_url = ["https://www.xbiquge345.com/"]

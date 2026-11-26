@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class NovelFullCrawler(NovelFullTemplate):
+    can_search = True
     base_url = [
         "http://novelfull.com/",
         "https://novelfull.com/",

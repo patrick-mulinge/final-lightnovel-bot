@@ -9,6 +9,7 @@ from lncrawl.templates.freewebnovel import FreewebnovelTemplate
 
 
 class FreewebnovelCrawler(FreewebnovelTemplate):
+    can_search = True
     base_url = [
         "https://freewebnovel.com/",
     ]

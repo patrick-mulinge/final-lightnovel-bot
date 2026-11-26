@@ -3,7 +3,7 @@
 
 import logging
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from lncrawl.core import Chapter, LegacyCrawler, Volume
 
@@ -13,6 +13,20 @@ logger = logging.getLogger(__name__)
 
 class NovelCeoCrawler(LegacyCrawler):
     base_url = ["https://novelceo.com/"]
+    can_search = True
+
+    def search_novel(self, query):
+        soup = self.get_soup(
+            f"{self.scraper.origin.rstrip('/')}/ajax/search-novel?keyword={quote(query)}"
+        )
+        for link in soup.select("a.list-group-item[href]"):
+            title = link.get("title") or link.get_text(" ", strip=True)
+            if title and "See more results" not in title:
+                yield {
+                    "title": title.strip(),
+                    "url": self.absolute_url(link["href"]),
+                    "info": "",
+                }
 
     SINGLES_UNTIL = 30      # chapter-1 .. chapter-30 are single pages
     RANGE_SIZE = 5          # then chapter-31-35, chapter-36-40, ...

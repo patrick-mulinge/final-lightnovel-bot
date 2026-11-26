@@ -5,11 +5,12 @@ import re
 from lncrawl.core import Chapter, LegacyCrawler, SearchResult
 
 logger = logging.getLogger(__name__)
-search_url = "https://www.royalroad.com/fictions/search?keyword=%s"
+search_url = "https://www.royalroad.com/fictions/search?title=%s"
 
 
 class RoyalRoadCrawler(LegacyCrawler):
     base_url = "https://www.royalroad.com/"
+    can_search = True
 
     def search_novel(self, query):
         query = query.lower().replace(" ", "+")
