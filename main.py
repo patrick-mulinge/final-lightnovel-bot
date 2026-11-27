@@ -2067,21 +2067,21 @@ threading.Thread(target=reap_orphaned_previews, daemon=True).start()
 # (including s4 once a slot frees up) claims pending rows, runs the search and
 # stores the results as JSON. s4 polls its own row and builds the session.
 SEARCH_LIMIT = None           # None = keep every result found (set a number to cap the list)
-SEARCH_CONCURRENCY = 15
-SEARCH_TIMEOUT = 30           # seconds a whole search may run
+SEARCH_CONCURRENCY = 10
+SEARCH_TIMEOUT = 60           # seconds a whole search may run
 # searches one server runs at once: 3 on the polling server (s4), 2 on the others
-SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "3" if SERVER_ID == "s4" else "2")))
+SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "2" if SERVER_ID == "s4" else "1")))
 SEARCH_QUEUE_WAIT = 300        # seconds the requester waits for a queued search
 SEARCH_POLL_INTERVAL = 3.0     # s4 checking its queued row
-SEARCH_CLAIM_INTERVAL = 3.0    # idle servers checking the queue
-SEARCH_PROGRESS_INTERVAL = 10  # seconds between progress edits sent to the user
+SEARCH_CLAIM_INTERVAL = 5.0    # idle servers checking the queue
+SEARCH_PROGRESS_INTERVAL = 7  # seconds between progress edits sent to the user
 SEARCH_PROGRESS_DB_INTERVAL = 4  # seconds between progress writes by a worker
 SEARCH_CACHE_SECONDS = 900     # identical queries inside this window reuse the earlier results
 SEARCH_PARTIAL_AFTER = 10      # show early results once a search has run this long
 SOURCE_DROP_AFTER = 5          # searches in a row a site must fail DNS before it is dropped
-SOURCE_RETRY_DAYS = 7          # a dropped site is tried again after this many days
+SOURCE_RETRY_DAYS = 3          # a dropped site is tried again after this many days
 _dropped_cache = {"at": 0.0, "urls": set()}
-SEARCH_HISTORY_DAYS = 30
+SEARCH_HISTORY_DAYS = 7
 search_lock = threading.Semaphore(SEARCH_SLOTS)
 
 
