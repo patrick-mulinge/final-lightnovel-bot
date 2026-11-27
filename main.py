@@ -2068,16 +2068,19 @@ threading.Thread(target=reap_orphaned_previews, daemon=True).start()
 # stores the results as JSON. s4 polls its own row and builds the session.
 SEARCH_LIMIT = None           # None = keep every result found (set a number to cap the list)
 SEARCH_CONCURRENCY = 10
-SEARCH_TIMEOUT = 60           # seconds a whole search may run
-# searches one server runs at once: 3 on the polling server (s4), 2 on the others
-SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "2" if SERVER_ID == "s4" else "1")))
-SEARCH_QUEUE_WAIT = 300        # seconds the requester waits for a queued search
+SEARCH_TIMEOUT = 120          # seconds a whole search may run (slow sources get this long)
+# searches one server runs at once: 2 on every server (override with the SEARCH_SLOTS env variable)
+SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "2")))
+SEARCH_QUEUE_WAIT = SEARCH_TIMEOUT + 240   # seconds the requester waits for a queued search (grows with SEARCH_TIMEOUT)
 SEARCH_POLL_INTERVAL = 3.0     # s4 checking its queued row
 SEARCH_CLAIM_INTERVAL = 5.0    # idle servers checking the queue
 SEARCH_PROGRESS_INTERVAL = 7  # seconds between progress edits sent to the user
 SEARCH_PROGRESS_DB_INTERVAL = 4  # seconds between progress writes by a worker
 SEARCH_CACHE_SECONDS = 900     # identical queries inside this window reuse the earlier results
-SEARCH_PARTIAL_AFTER = 10      # show early results once a search has run this long
+SEARCH_PARTIAL_TIMES = (60, 90)  # seconds into a search when an interim list is shown; the final list arrives when the search ends
+RESULTS_PER_PAGE = 10          # novels shown per page in /search results. Change this one number to resize pages.
+SEARCH_ETA_TEXT = "Search will take 1-2 minutes"   # line shown under "Searching for ..." while sources are scanned
+SEARCH_STILL_TEXT = f"🔄 Still searching more sources... the final list will be provided within {max(1, round(SEARCH_TIMEOUT / 60))} minutes."
 SOURCE_DROP_AFTER = 5          # searches in a row a site must fail DNS before it is dropped
 SOURCE_RETRY_DAYS = 3          # a dropped site is tried again after this many days
 _dropped_cache = {"at": 0.0, "urls": set()}
@@ -2096,8 +2099,46 @@ def _classify_search_error(error):
     return "dns" if any(m in text for m in SEARCH_DNS_MARKERS) else "other"
 
 
-def _combine_search_records(records, query, limit):
+def _norm_search_text(text):
+    """Lowercase, drop punctuation, collapse spaces: "Mad-God's Return!" -> "mad god s return"."""
+    return re.sub(r"[\W_]+", " ", str(text or "").lower()).strip()
+
+
+def _rank_search_results(results, query):
+    """Order results by how well the TITLE matches the query, best first.
+
+    Tier 0: title is exactly the query            (Mad God)
+    Tier 1: title starts with the query           (Mad God Reborn)
+    Tier 2: title contains the query as a phrase  (The Legend of Mad God)
+    Tier 3: title has every query word, any order (God of the Mad)
+    Tier 4: everything else, closest spelling first (Made by God ...)
+    Inside a tier: closer spelling first, then more sources.
+    Works on any objects with .title and .novels, so it is safe to run on cached or queued results too."""
     from difflib import SequenceMatcher
+    q = _norm_search_text(query)
+    if not q:
+        return list(results)
+    q_words = set(q.split())
+
+    def _key(result):
+        t = _norm_search_text(result.title)
+        if t == q:
+            tier = 0
+        elif t.startswith(q + " "):
+            tier = 1
+        elif f" {q} " in f" {t} ":
+            tier = 2
+        elif q_words <= set(t.split()):
+            tier = 3
+        else:
+            tier = 4
+        ratio = SequenceMatcher(a=t, b=q).ratio()
+        return (tier, -ratio, -len(result.novels))
+
+    return sorted(results, key=_key)
+
+
+def _combine_search_records(records, query, limit):
     from slugify import slugify
     from lncrawl.core import CombinedSearchResult
 
@@ -2115,7 +2156,7 @@ def _combine_search_records(records, query, limit):
     for key, value in combined.items():
         value = sorted(value, key=lambda x: x.url)
         results.append(CombinedSearchResult(id=key, novels=value, title=value[0].title))
-    results.sort(key=lambda x: (-len(x.novels), -SequenceMatcher(a=x.title, b=query).ratio()))
+    results = _rank_search_results(results, query)
     return results[:limit]
 
 
@@ -2182,7 +2223,7 @@ def _record_source_health(outcomes):
 
 def _perform_search_with_progress(query, sources, limit, concurrency, timeout, on_progress=None, on_partial=None):
     """lncrawl's perform_search plus: on_progress(done, total) every ~2s, one early
-    on_partial(results) after SEARCH_PARTIAL_AFTER seconds, and per-source health tracking."""
+    on_partial(results) at each SEARCH_PARTIAL_TIMES mark (60s, 90s), and per-source health tracking."""
     from concurrent.futures import TimeoutError as FutureTimeout
     from threading import Event
     from lncrawl.core import TaskManager
@@ -2206,16 +2247,19 @@ def _perform_search_with_progress(query, sources, limit, concurrency, timeout, o
     stop = Event()
     records = []
     t0 = time.time()
-    partial_sent = [False]
+    partial_sent = set()
 
     def _monitor():
         while not stop.wait(2.0):
             try:
                 if on_progress:
                     on_progress(sum(1 for f in futures if f.done()), total)
-                if on_partial and not partial_sent[0] and records and time.time() - t0 >= SEARCH_PARTIAL_AFTER:
-                    partial_sent[0] = True
-                    on_partial(_combine_search_records(list(records), query, limit))
+                if on_partial and records:
+                    elapsed = time.time() - t0
+                    due = [m for m in SEARCH_PARTIAL_TIMES if elapsed >= m and m not in partial_sent]
+                    if due:
+                        partial_sent.update(due)
+                        on_partial(_combine_search_records(list(records), query, limit))
             except Exception:
                 pass
 
@@ -2387,6 +2431,20 @@ def _search_get(row_id, want_partial=False):
         conn.close()
 
 
+def _unpack_partial(data):
+    """partial_results is stored as {"seq": n, "results": [...]}; returns (seq, results or None)."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return 0, None
+    if isinstance(data, dict):
+        return int(data.get("seq") or 0), data.get("results")
+    if isinstance(data, list):
+        return 1, data
+    return 0, None
+
+
 def _search_partial_update(row_id, partial):
     conn = get_db_connection()
     if not conn:
@@ -2543,10 +2601,10 @@ def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb
 
     print(f"[SEARCH] {SERVER_ID} busy; queued search {row_id} for user={user_id} query={query!r}")
     deadline = time.time() + SEARCH_QUEUE_WAIT
-    partial_seen = False
+    last_partial_seq = 0
     while time.time() < deadline:
         time.sleep(SEARCH_POLL_INTERVAL)
-        row = _search_get(row_id, want_partial=not partial_seen)
+        row = _search_get(row_id, want_partial=True)
         if not row:
             continue
         if row["status"] == "done":
@@ -2561,9 +2619,10 @@ def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb
                     "total": row["progress_total"],
                     "ahead": row["ahead"],
                 })
-                if row.get("partial_results") and not partial_seen:
-                    partial_seen = True
-                    progress_cb({"phase": "running", "partial": _deserialize_search_results(row["partial_results"])})
+                seq, items = _unpack_partial(row.get("partial_results"))
+                if items and seq > last_partial_seq:
+                    last_partial_seq = seq
+                    progress_cb({"phase": "running", "partial": _deserialize_search_results(items)})
             except Exception as e:
                 print(f"[SEARCH] progress callback failed: {e}")
     _search_abandon(row_id)
@@ -2616,12 +2675,11 @@ def _run_claimed_search(row):
             last_write[0] = now
             _search_progress_update(row["id"], done, total)
 
-    partial_written = [False]
+    partial_seq = [0]
 
     def _partial(results):
-        if not partial_written[0]:
-            partial_written[0] = True
-            _search_partial_update(row["id"], _serialize_search_results(results))
+        partial_seq[0] += 1
+        _search_partial_update(row["id"], {"seq": partial_seq[0], "results": _serialize_search_results(results)})
 
     try:
         results, count = run_lncrawl_search(row["query"], on_progress=_progress, on_partial=_partial)
@@ -4337,7 +4395,6 @@ if SERVER_ID == "s4":
     # ---------------------- /search ----------------------
     # SEARCH_LIMIT / SEARCH_CONCURRENCY / SEARCH_TIMEOUT / search_lock and
     # run_lncrawl_search now live at module level (search queue section).
-    SEARCH_PAGE_SIZE = 5
     SEARCH_SESSION_SECONDS = 600
     search_sessions = {}
     active_search_sessions = {}
@@ -4383,21 +4440,26 @@ if SERVER_ID == "s4":
         markup = telebot.types.InlineKeyboardMarkup()
         if view == "list":
             page = session["page"]
-            start = page * SEARCH_PAGE_SIZE
-            for result_index, result in enumerate(session["results"][start:start + SEARCH_PAGE_SIZE], start=start):
+            start = page * RESULTS_PER_PAGE
+            for result_index, result in enumerate(session["results"][start:start + RESULTS_PER_PAGE], start=start):
                 label = f"{result_index + 1}. {result.title}"[:60]
                 markup.add(telebot.types.InlineKeyboardButton(
                     label,
                     callback_data=_search_callback_data(token, "title", result_index),
                 ))
-            pages = max(1, (len(session["results"]) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
-            controls = []
-            if page:
-                controls.append(telebot.types.InlineKeyboardButton("Back", callback_data=_search_callback_data(token, "page", page - 1)))
-            controls.append(telebot.types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=_search_callback_data(token, "noop")))
-            if page + 1 < pages:
-                controls.append(telebot.types.InlineKeyboardButton("Next", callback_data=_search_callback_data(token, "page", page + 1)))
-            markup.row(*controls)
+            pages = max(1, (len(session["results"]) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+            counter = telebot.types.InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=_search_callback_data(token, "noop"))
+            if pages > 1:
+                # [<<] [Back] [24/35] [Next] [>>]  - Back from page 1 wraps to the last page, Next from the last wraps to page 1
+                markup.row(
+                    telebot.types.InlineKeyboardButton("<<", callback_data=_search_callback_data(token, "page", 0)),
+                    telebot.types.InlineKeyboardButton("Back", callback_data=_search_callback_data(token, "page", (page - 1) % pages)),
+                    counter,
+                    telebot.types.InlineKeyboardButton("Next", callback_data=_search_callback_data(token, "page", (page + 1) % pages)),
+                    telebot.types.InlineKeyboardButton(">>", callback_data=_search_callback_data(token, "page", pages - 1)),
+                )
+            else:
+                markup.row(counter)
         elif view == "sources":
             result = session["results"][index]
             for source_index, novel in enumerate(result.novels):
@@ -4427,8 +4489,11 @@ if SERVER_ID == "s4":
                     link_preview_options=telebot.types.LinkPreviewOptions(is_disabled=True),
                 )
                 return
-        except Exception:
-            pass
+        except Exception as error:
+            # Pressing << on page 1 (or any button that renders the same page) makes Telegram
+            # answer "message is not modified". That is not a failure, so do not post a duplicate.
+            if "message is not modified" in str(error).lower():
+                return
         try:
             sent = bot.send_message(
                 session["chat_id"],
@@ -4441,18 +4506,30 @@ if SERVER_ID == "s4":
         except Exception as error:
             print(f"[SEARCH MESSAGE ERROR] {error}")
 
+    def _merge_search_results(shown, new, keep):
+        """Fold a newer ranked list into the one on screen. Whatever sits on page 1 (the first `keep`
+        entries) keeps its number and order and only gains sources; everything after that follows the new ranking."""
+        new_by_id = {r.id: r for r in new}
+        frozen = [new_by_id.pop(r.id, r) for r in shown[:keep]]
+        rest = [r for r in new if r.id in new_by_id]
+        return frozen + rest
+
     def _render_search_list(session):
-        if session.get("final_results") is not None:
-            session["results"] = session.pop("final_results")
+        pending = session.pop("pending", None)
+        if pending is not None:
+            session["results"] = _merge_search_results(session["results"], pending, RESULTS_PER_PAGE)
         session["view"] = "list"
         page = session["page"]
-        start = page * SEARCH_PAGE_SIZE
+        start = page * RESULTS_PER_PAGE
         entries = []
-        for result_index, result in enumerate(session["results"][start:start + SEARCH_PAGE_SIZE], start=start + 1):
+        for result_index, result in enumerate(session["results"][start:start + RESULTS_PER_PAGE], start=start + 1):
             entries.append(f"<b>{result_index}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))")
         text = "<b>Here are the novels I found for your query:</b>\n\n" + "\n\n".join(entries)
         if session.get("searching"):
-            text += "\n\n🔄 Still searching more sources... this list will refresh when done."
+            done, total = session.get("progress") or (0, 0)
+            text += "\n\n" + SEARCH_STILL_TEXT
+            if total:
+                text += f" Searched {done}/{total} sources"
         _search_edit(session, text, _search_markup(session, "list"))
 
     def _render_search_sources(session, result_index):
@@ -4495,7 +4572,7 @@ if SERVER_ID == "s4":
         threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token, user), daemon=True).start()
 
     def _search_progress_text(query, info):
-        head = f"Searching for {query}..."
+        head = f"Searching for {query}...\n{SEARCH_ETA_TEXT}"
         if info.get("phase") == "queued":
             return f"{head}\n\nWaiting for a free server..."
         done, total = info.get("done") or 0, info.get("total") or 0
@@ -4504,64 +4581,83 @@ if SERVER_ID == "s4":
         return f"{head}\n\nSearched {done}/{total} sources"
 
     def _search_worker(chat_id, user_id, query, mode, token, user=None):
-        searching_msg = safe_send_message(chat_id, f"Searching for {query}...")
-        state = {"last_edit": time.time(), "last_text": None, "session": None}
+        searching_msg = safe_send_message(chat_id, f"Searching for {query}...\n{SEARCH_ETA_TEXT}")
+        state = {"last_edit": time.time(), "last_text": None, "session": None, "progress": (0, 0)}
+
+        def _drop_searching_msg():
+            if searching_msg:
+                try:
+                    bot.delete_message(chat_id, searching_msg.message_id)
+                except Exception:
+                    pass
 
         def _show_partial(partial):
-            """Turn the 'Searching...' message into the result list while slow sources finish."""
-            if not partial or not searching_msg or state["session"] is not None:
+            """Interim list (at 60s, 90s). The first one turns the 'Searching...' message into the list;
+            later ones are folded in so page 1 never reshuffles under the user."""
+            if not partial or not searching_msg:
+                return
+            session = state["session"]
+            if session is None:
+                with search_session_lock:
+                    if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
+                        return
+                    session = {
+                        "token": token,
+                        "chat_id": chat_id,
+                        "user_id": user_id,
+                        "query": query,
+                        "mode": mode,
+                        "results": partial,
+                        "page": 0,
+                        "expires": time.time() + SEARCH_SESSION_SECONDS,
+                        "message_id": searching_msg.message_id,
+                        "searching": True,
+                        "progress": state["progress"],
+                        "view": "list",
+                    }
+                    search_sessions[token] = session
+                state["session"] = session
+                _render_search_list(session)
+                threading.Thread(target=_expire_search_session, args=(token,), daemon=True).start()
                 return
             with search_session_lock:
-                if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
+                if active_search_sessions.get(_search_key(chat_id, user_id)) != token or token not in search_sessions:
                     return
-                session = {
-                    "token": token,
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "query": query,
-                    "mode": mode,
-                    "results": partial,
-                    "page": 0,
-                    "expires": time.time() + SEARCH_SESSION_SECONDS,
-                    "message_id": searching_msg.message_id,
-                    "searching": True,
-                    "view": "list",
-                }
-                search_sessions[token] = session
-            state["session"] = session
-            _render_search_list(session)
-            threading.Thread(target=_expire_search_session, args=(token,), daemon=True).start()
-
-        def _merge_results(shown, final):
-            """Keep every title the user already saw in place (with any new sources
-            added), then append the titles found later."""
-            final_by_id = {r.id: r for r in final}
-            merged = [final_by_id.pop(r.id, r) for r in shown]
-            merged += [r for r in final if r.id in final_by_id]
-            return merged
+            session["pending"] = partial          # applied now if they are on the list, otherwise when they go back to it
+            if session.get("view", "list") == "list":
+                _render_search_list(session)
 
         def _finish_partial(final_results):
-            """The search ended after early results were shown: swap in the final list."""
+            """Search ended after interim lists were shown: apply the final list and drop the 'still searching' note."""
             session = state["session"]
             with search_session_lock:
                 if active_search_sessions.get(_search_key(chat_id, user_id)) != token or token not in search_sessions:
                     return
             session["searching"] = False
             if final_results:
-                merged = _merge_results(session["results"], final_results)
-                if session.get("view", "list") == "list":
-                    session["results"] = merged
-                else:
-                    session["final_results"] = merged   # applied when they go back to the list
+                session["pending"] = final_results
             if session.get("view", "list") == "list":
                 _render_search_list(session)
 
         def progress_cb(info):
-            now = time.time()
             if "partial" in info:
                 _show_partial(info["partial"])
                 return
-            if state["session"] is not None or not searching_msg or now - state["last_edit"] < SEARCH_PROGRESS_INTERVAL:
+            if not searching_msg:
+                return
+            done, total = info.get("done") or 0, info.get("total") or 0
+            if total:
+                state["progress"] = (done, total)
+            now = time.time()
+            if now - state["last_edit"] < SEARCH_PROGRESS_INTERVAL:
+                return
+            session = state["session"]
+            if session is not None:
+                # List is on screen: refresh its "Searched x/y" footer, but never over the sources/confirm screens.
+                session["progress"] = state["progress"]
+                if session.get("searching") and session.get("view", "list") == "list":
+                    state["last_edit"] = now
+                    _render_search_list(session)
                 return
             text = _search_progress_text(query, info)
             if text == state["last_text"]:
@@ -4577,27 +4673,26 @@ if SERVER_ID == "s4":
             results, source_count = run_search_request(chat_id, user_id, user, query, mode, progress_cb=progress_cb)
         except Exception as error:
             if state["session"] is not None:
-                _finish_partial(None)      # keep the early list, just stop the 'still searching' note
+                _finish_partial(None)      # keep the interim list, just stop the 'still searching' note
                 return
+            _drop_searching_msg()
             print(f"[SEARCH ERROR] user={user_id} query={query!r}: {type(error).__name__}: {error}")
             send_temp_message(chat_id, f"Search failed: {type(error).__name__}: {error}", user_id)
             return
-        finally:
-            if searching_msg and state["session"] is None:
-                try:
-                    bot.delete_message(chat_id, searching_msg.message_id)
-                except Exception:
-                    pass
+        # Cached and queued results may come from an older ordering, so always rank here too.
+        results = _rank_search_results(results, query)
         print(f"[SEARCH] user={user_id} query={query!r} -> {len(results)} result(s) from {source_count} sources")
         if state["session"] is not None:
             _finish_partial(results)
             return
         with search_session_lock:
             if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
+                _drop_searching_msg()
                 return
             if not results:
                 active_search_sessions.pop(_search_key(chat_id, user_id), None)
         if not results:
+            _drop_searching_msg()
             send_temp_message(chat_id, f"No results found for {query}.\nTry a shorter or different name.", user_id)
             return
         session = {
@@ -4609,7 +4704,8 @@ if SERVER_ID == "s4":
             "results": results,
             "page": 0,
             "expires": time.time() + SEARCH_SESSION_SECONDS,
-            "message_id": None,
+            # The "Searching..." message turns into the result list in place.
+            "message_id": searching_msg.message_id if searching_msg else None,
             "view": "list",
         }
         with search_session_lock:
@@ -4655,7 +4751,7 @@ if SERVER_ID == "s4":
             bot.answer_callback_query(call.id, "Search cancelled.")
             return
         if action == "page":
-            session["page"] = max(0, min(int(value), (len(session["results"]) - 1) // SEARCH_PAGE_SIZE))
+            session["page"] = max(0, min(int(value), (len(session["results"]) - 1) // RESULTS_PER_PAGE))
             _render_search_list(session)
         elif action == "list":
             _render_search_list(session)
