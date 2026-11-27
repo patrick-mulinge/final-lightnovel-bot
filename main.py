@@ -7,7 +7,7 @@ import queue
 import time
 import datetime
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 import re
 import html
 import json
@@ -483,6 +483,62 @@ def setup_preview_table():
     finally:
         conn.close()
 
+def setup_search_table():
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS search_requests (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    chat_id BIGINT,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    query TEXT NOT NULL,
+                    mode TEXT DEFAULT 'search',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    queued BOOLEAN DEFAULT FALSE,
+                    origin_server TEXT,
+                    origin_run_id TEXT,
+                    server_id TEXT,
+                    run_id TEXT,
+                    attempts INT DEFAULT 0,
+                    source_count INT,
+                    result_count INT,
+                    results JSONB,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                );
+            """)
+            cur.execute("ALTER TABLE search_requests ADD COLUMN IF NOT EXISTS progress_done INT;")
+            cur.execute("ALTER TABLE search_requests ADD COLUMN IF NOT EXISTS progress_total INT;")
+            cur.execute("ALTER TABLE search_requests ADD COLUMN IF NOT EXISTS partial_results JSONB;")
+            cur.execute("ALTER TABLE search_requests ADD COLUMN IF NOT EXISTS cached BOOLEAN DEFAULT FALSE;")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS search_source_health (
+                    url TEXT PRIMARY KEY,
+                    dns_failures INT DEFAULT 0,
+                    dropped BOOLEAN DEFAULT FALSE,
+                    dropped_at TIMESTAMP,
+                    last_error TEXT,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_search_requests_status ON search_requests (status, id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_search_requests_created ON search_requests (created_at);")
+            conn.commit()
+            print("[DB] search_requests table ready")
+    except Exception as e:
+        conn.rollback()
+        print(f"[DB SETUP ERROR] search_requests: {e}")
+    finally:
+        conn.close()
+
 def setup_server_table():
     conn = get_db_connection()
     if not conn:
@@ -655,6 +711,7 @@ if conn:
     conn.close()
     setup_tasks_table()
     setup_preview_table()
+    setup_search_table()
     setup_server_table()
     setup_user_controls_table()
     setup_pending_uploads_table()
@@ -2003,6 +2060,665 @@ def reap_orphaned_previews():
         time.sleep(15)
 
 threading.Thread(target=reap_orphaned_previews, daemon=True).start()
+
+# ---------------------- SEARCH QUEUE (search_requests) ----------------------
+# s4 searches by itself when it has a free slot. When every slot is busy it
+# writes the search to the search_requests table instead; any v4 server
+# (including s4 once a slot frees up) claims pending rows, runs the search and
+# stores the results as JSON. s4 polls its own row and builds the session.
+SEARCH_LIMIT = 10
+SEARCH_CONCURRENCY = 15
+SEARCH_TIMEOUT = 30           # seconds a whole search may run
+# searches one server runs at once: 3 on the polling server (s4), 2 on the others
+SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "3" if SERVER_ID == "s4" else "2")))
+SEARCH_QUEUE_WAIT = 300        # seconds the requester waits for a queued search
+SEARCH_POLL_INTERVAL = 3.0     # s4 checking its queued row
+SEARCH_CLAIM_INTERVAL = 3.0    # idle servers checking the queue
+SEARCH_PROGRESS_INTERVAL = 10  # seconds between progress edits sent to the user
+SEARCH_PROGRESS_DB_INTERVAL = 4  # seconds between progress writes by a worker
+SEARCH_CACHE_SECONDS = 900     # identical queries inside this window reuse the earlier results
+SEARCH_PARTIAL_AFTER = 10      # show early results once a search has run this long
+SOURCE_DROP_AFTER = 5          # searches in a row a site must fail DNS before it is dropped
+SOURCE_RETRY_DAYS = 7          # a dropped site is tried again after this many days
+_dropped_cache = {"at": 0.0, "urls": set()}
+SEARCH_HISTORY_DAYS = 30
+search_lock = threading.Semaphore(SEARCH_SLOTS)
+
+
+SEARCH_DNS_MARKERS = ("DNSError", "Cloudflare 1000", "NameResolutionError", "Name or service not known", "getaddrinfo")
+
+
+def _classify_search_error(error):
+    """'dns' = the domain no longer resolves, 'aborted' = we cancelled it, 'other' = the site answered somehow."""
+    if "Abort" in type(error).__name__:
+        return "aborted"
+    text = f"{type(error).__name__}: {error} {error!r}"
+    return "dns" if any(m in text for m in SEARCH_DNS_MARKERS) else "other"
+
+
+def _combine_search_records(records, query, limit):
+    from difflib import SequenceMatcher
+    from slugify import slugify
+    from lncrawl.core import CombinedSearchResult
+
+    combined = {}
+    for item in records:
+        if not (item and isinstance(item.title, str)):
+            continue
+        item.title = str(item.title).strip()
+        item.info = str(item.info).strip()
+        key = slugify(item.title)
+        if len(key) <= 2:
+            continue
+        combined.setdefault(key, []).append(item)
+    results = []
+    for key, value in combined.items():
+        value = sorted(value, key=lambda x: x.url)
+        results.append(CombinedSearchResult(id=key, novels=value, title=value[0].title))
+    results.sort(key=lambda x: (-len(x.novels), -SequenceMatcher(a=x.title, b=query).ratio()))
+    return results[:limit]
+
+
+def _dropped_search_sources():
+    """URLs of sources that failed DNS SOURCE_DROP_AFTER searches in a row (cached 5 min)."""
+    if time.time() - _dropped_cache["at"] < 300:
+        return _dropped_cache["urls"]
+    conn = get_db_connection()
+    if not conn:
+        return _dropped_cache["urls"]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT url FROM search_source_health
+                WHERE dropped AND dropped_at > NOW() - make_interval(days => %s)
+            """, (SOURCE_RETRY_DAYS,))
+            _dropped_cache["urls"] = {r["url"] for r in cur.fetchall()}
+            _dropped_cache["at"] = time.time()
+    except Exception as e:
+        print(f"[SEARCH SOURCES] could not load dropped sources: {e}")
+    finally:
+        conn.close()
+    return _dropped_cache["urls"]
+
+
+def _record_source_health(outcomes):
+    """Count DNS failures per source across searches; drop sources that keep failing."""
+    alive = [u for u, o in outcomes.items() if o in ("ok", "other")]
+    dead = [u for u, o in outcomes.items() if o == "dns"]
+    # If nothing answered, or most sources 'failed DNS', it is our own network: record nothing.
+    if not alive or len(dead) > 0.75 * max(1, len(outcomes)):
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            if dead:
+                cur.execute("""
+                    INSERT INTO search_source_health (url, dns_failures, dropped, dropped_at, last_error, updated_at)
+                    SELECT u, 1, (1 >= %s), CASE WHEN 1 >= %s THEN NOW() END, 'DNS failure', NOW()
+                    FROM unnest(%s::text[]) AS u
+                    ON CONFLICT (url) DO UPDATE SET
+                        dns_failures = search_source_health.dns_failures + 1,
+                        dropped = search_source_health.dns_failures + 1 >= %s,
+                        dropped_at = CASE WHEN search_source_health.dns_failures + 1 >= %s
+                                          THEN NOW() ELSE search_source_health.dropped_at END,
+                        last_error = 'DNS failure',
+                        updated_at = NOW()
+                """, (SOURCE_DROP_AFTER, SOURCE_DROP_AFTER, dead, SOURCE_DROP_AFTER, SOURCE_DROP_AFTER))
+            if alive:
+                cur.execute("""
+                    UPDATE search_source_health
+                    SET dns_failures = 0, dropped = FALSE, dropped_at = NULL, updated_at = NOW()
+                    WHERE url = ANY(%s) AND (dns_failures > 0 OR dropped)
+                """, (alive,))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH SOURCES] health update failed: {e}")
+    finally:
+        conn.close()
+
+
+def _perform_search_with_progress(query, sources, limit, concurrency, timeout, on_progress=None, on_partial=None):
+    """lncrawl's perform_search plus: on_progress(done, total) every ~2s, one early
+    on_partial(results) after SEARCH_PARTIAL_AFTER seconds, and per-source health tracking."""
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from threading import Event
+    from lncrawl.core import TaskManager
+    from lncrawl.commands.search.helper import search_job
+
+    outcomes = {}
+
+    def _job(source, q, sig, tmo):
+        try:
+            result = search_job(source, q, sig, tmo)
+        except Exception as e:
+            outcomes[source.url] = _classify_search_error(e)
+            raise
+        outcomes[source.url] = "ok"
+        return result
+
+    signal = Event()
+    taskman = TaskManager(concurrency, signal=signal)
+    futures = [taskman.submit_task(_job, source, query, signal, timeout) for source in sources]
+    total = len(futures)
+    stop = Event()
+    records = []
+    t0 = time.time()
+    partial_sent = [False]
+
+    def _monitor():
+        while not stop.wait(2.0):
+            try:
+                if on_progress:
+                    on_progress(sum(1 for f in futures if f.done()), total)
+                if on_partial and not partial_sent[0] and records and time.time() - t0 >= SEARCH_PARTIAL_AFTER:
+                    partial_sent[0] = True
+                    on_partial(_combine_search_records(list(records), query, limit))
+            except Exception:
+                pass
+
+    if on_progress or on_partial:
+        if on_progress:
+            try:
+                on_progress(0, total)
+            except Exception:
+                pass
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    try:
+        for result in taskman.resolve(
+            futures, unit="source", desc="Searching", signal=signal, timeout=timeout,
+        ):
+            records += result or []
+    except FutureTimeout:
+        print(f"[SEARCH] some sources did not answer within {timeout:.0f}s")
+    except Exception as e:
+        print(f"[SEARCH] perform failed: {type(e).__name__}: {e}")
+    finally:
+        signal.set()
+        taskman.shutdown()
+        stop.set()
+
+    threading.Thread(target=_record_source_health, args=(dict(outcomes),), daemon=True).start()
+    return _combine_search_records(records, query, limit)
+
+
+def run_lncrawl_search(query, on_progress=None, on_partial=None):
+    """Run the same source search used by the lncrawl CLI."""
+    ctx, _ = _v4()
+    ctx.setup()
+    ctx.sources.ensure_load()
+    # The index's can_search flag is stale for many sources (libread, novelhi,
+    # royalroad, ...), so also trust the crawler class's own can_search.
+    sources = [
+        s for s in ctx.sources.list(None, include_rejected=False)
+        if s.can_search
+        or getattr(ctx.sources.crawlers.get(s.crawler_id), "can_search", False)
+    ]
+    dropped = _dropped_search_sources()
+    if dropped:
+        kept = [s for s in sources if s.url not in dropped]
+        if kept:
+            sources = kept
+    if not sources:
+        raise Exception("No searchable sources available")
+    return _perform_search_with_progress(
+        query, sources, SEARCH_LIMIT, SEARCH_CONCURRENCY, SEARCH_TIMEOUT, on_progress, on_partial,
+    ), len(sources)
+
+
+def _serialize_search_results(results):
+    return [
+        {
+            "id": str(getattr(r, "id", "") or ""),
+            "title": r.title,
+            "novels": [
+                {"title": n.title, "url": n.url, "info": n.info or ""}
+                for n in r.novels
+            ],
+        }
+        for r in results
+    ]
+
+
+def _deserialize_search_results(data):
+    from types import SimpleNamespace
+    if isinstance(data, str):
+        data = json.loads(data)
+    return [
+        SimpleNamespace(
+            id=r.get("id", ""),
+            title=r["title"],
+            novels=[SimpleNamespace(**n) for n in r.get("novels", [])],
+        )
+        for r in (data or [])
+    ]
+
+
+def _search_log_insert(chat_id, user_id, user, query, mode, queued):
+    """Insert a search row. queued=False -> already running here; True -> pending."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO search_requests
+                    (user_id, chat_id, username, first_name, last_name, query, mode,
+                     status, queued, origin_server, origin_run_id,
+                     server_id, run_id, started_at, attempts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, CASE WHEN %s THEN NULL ELSE NOW() END, %s)
+                RETURNING id
+            """, (
+                user_id, chat_id,
+                getattr(user, "username", None),
+                getattr(user, "first_name", None),
+                getattr(user, "last_name", None),
+                query, mode,
+                "pending" if queued else "processing", queued, SERVER_ID, RUN_ID,
+                None if queued else SERVER_ID, None if queued else RUN_ID,
+                queued, 0 if queued else 1,
+            ))
+            row = cur.fetchone()
+            conn.commit()
+            return row["id"]
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] insert failed: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _search_log_finish(row_id, results=None, source_count=None, status="done", error=None):
+    if row_id is None:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE search_requests
+                SET status = %s, results = %s, source_count = %s, result_count = %s,
+                    error = %s, completed_at = NOW(), partial_results = NULL
+                WHERE id = %s AND status = 'processing'
+            """, (
+                status,
+                Json(results) if results is not None else None,
+                source_count,
+                len(results) if results is not None else None,
+                (error or None) and str(error)[:500],
+                row_id,
+            ))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] finish failed for {row_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _search_get(row_id, want_partial=False):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    partial_sql = "p.partial_results" if want_partial else "NULL::jsonb"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT p.status, p.results, p.source_count, p.error,
+                       p.progress_done, p.progress_total,
+                       {partial_sql} AS partial_results,
+                       (SELECT COUNT(*) FROM search_requests q
+                        WHERE q.status = 'pending' AND q.id < p.id) AS ahead
+                FROM search_requests p
+                WHERE p.id = %s
+            """, (row_id,))
+            return cur.fetchone()
+    except Exception as e:
+        print(f"[SEARCH DB] read failed for {row_id}: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _search_partial_update(row_id, partial):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE search_requests SET partial_results = %s
+                WHERE id = %s AND status = 'processing'
+            """, (Json(partial), row_id))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] partial update failed for {row_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _search_cache_lookup(query):
+    """A finished, non-empty, real (not itself cached) search for the same query in the last 15 min."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT results, source_count FROM search_requests
+                WHERE status = 'done' AND cached IS NOT TRUE
+                  AND result_count > 0 AND results IS NOT NULL
+                  AND LOWER(BTRIM(query)) = LOWER(BTRIM(%s))
+                  AND completed_at > NOW() - make_interval(secs => %s)
+                ORDER BY id DESC
+                LIMIT 1
+            """, (query, SEARCH_CACHE_SECONDS))
+            return cur.fetchone()
+    except Exception as e:
+        print(f"[SEARCH DB] cache lookup failed: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _search_log_cached(chat_id, user_id, user, query, mode, results_json, source_count):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO search_requests
+                    (user_id, chat_id, username, first_name, last_name, query, mode,
+                     status, queued, origin_server, origin_run_id, server_id, run_id,
+                     started_at, completed_at, attempts, source_count, result_count,
+                     results, cached)
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
+                        'done', FALSE, %s, %s, %s, %s,
+                        NOW(), NOW(), 0, %s, %s,
+                        %s, TRUE)
+            """, (
+                user_id, chat_id,
+                getattr(user, "username", None),
+                getattr(user, "first_name", None),
+                getattr(user, "last_name", None),
+                query, mode,
+                SERVER_ID, RUN_ID, SERVER_ID, RUN_ID,
+                source_count, len(results_json or []),
+                Json(results_json),
+            ))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] cache log failed: {e}")
+    finally:
+        conn.close()
+
+
+def _search_progress_update(row_id, done, total):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE search_requests SET progress_done = %s, progress_total = %s
+                WHERE id = %s AND status = 'processing'
+            """, (done, total, row_id))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] progress update failed for {row_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _search_abandon(row_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE search_requests
+                SET status = 'abandoned', error = 'timed out waiting for a server',
+                    completed_at = NOW()
+                WHERE id = %s AND status IN ('pending', 'processing')
+            """, (row_id,))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] abandon failed for {row_id}: {e}")
+    finally:
+        conn.close()
+
+
+def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb=None):
+    """Used by s4's /search. Returns (results, source_count).
+
+    Same query within SEARCH_CACHE_SECONDS -> reuse the earlier results.
+    Free slot -> search right here. All slots busy -> queue the search in the
+    DB and wait for whichever server claims it (possibly s4 itself).
+    progress_cb(info) gets {"phase": "queued"|"running", "done", "total", "ahead"}
+    and, once, {"phase": "running", "partial": [early results]}."""
+    cached = _search_cache_lookup(query)
+    if cached:
+        count = cached["source_count"] or 0
+        _search_log_cached(chat_id, user_id, user, query, mode, cached["results"], count)
+        print(f"[SEARCH] cache hit for user={user_id} query={query!r}")
+        return _deserialize_search_results(cached["results"]), count
+
+    if search_lock.acquire(blocking=False):
+        row_id = _search_log_insert(chat_id, user_id, user, query, mode, queued=False)
+        local_progress = local_partial = None
+        if progress_cb:
+            local_progress = lambda d, t: progress_cb({"phase": "running", "done": d, "total": t})
+            local_partial = lambda res: progress_cb({"phase": "running", "partial": res})
+        try:
+            results, count = run_lncrawl_search(query, on_progress=local_progress, on_partial=local_partial)
+        except Exception as error:
+            search_lock.release()
+            _search_log_finish(row_id, status="failed", error=f"{type(error).__name__}: {error}")
+            raise
+        search_lock.release()
+        try:
+            _search_log_finish(row_id, _serialize_search_results(results), count)
+        except Exception as e:
+            print(f"[SEARCH DB] could not log results for {row_id}: {e}")
+        return results, count
+
+    row_id = _search_log_insert(chat_id, user_id, user, query, mode, queued=True)
+    if row_id is None:
+        # DB unavailable: fall back to waiting for a local slot.
+        with search_lock:
+            return run_lncrawl_search(query)
+
+    print(f"[SEARCH] {SERVER_ID} busy; queued search {row_id} for user={user_id} query={query!r}")
+    deadline = time.time() + SEARCH_QUEUE_WAIT
+    partial_seen = False
+    while time.time() < deadline:
+        time.sleep(SEARCH_POLL_INTERVAL)
+        row = _search_get(row_id, want_partial=not partial_seen)
+        if not row:
+            continue
+        if row["status"] == "done":
+            return _deserialize_search_results(row["results"]), row["source_count"] or 0
+        if row["status"] in ("failed", "abandoned"):
+            raise Exception(row["error"] or "Search failed")
+        if progress_cb:
+            try:
+                progress_cb({
+                    "phase": "queued" if row["status"] == "pending" else "running",
+                    "done": row["progress_done"],
+                    "total": row["progress_total"],
+                    "ahead": row["ahead"],
+                })
+                if row.get("partial_results") and not partial_seen:
+                    partial_seen = True
+                    progress_cb({"phase": "running", "partial": _deserialize_search_results(row["partial_results"])})
+            except Exception as e:
+                print(f"[SEARCH] progress callback failed: {e}")
+    _search_abandon(row_id)
+    raise Exception("Search timed out waiting for a free server. Please try again.")
+
+
+def _claim_search_request():
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM search_requests
+                WHERE status = 'pending'
+                ORDER BY id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            """)
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            cur.execute("""
+                UPDATE search_requests
+                SET status = 'processing', server_id = %s, run_id = %s,
+                    started_at = NOW(), attempts = attempts + 1
+                WHERE id = %s AND status = 'pending'
+                RETURNING *
+            """, (SERVER_ID, RUN_ID, row["id"]))
+            claimed = cur.fetchone()
+            conn.commit()
+            return claimed
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH QUEUE] claim failed: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def _run_claimed_search(row):
+    """Runs on a thread; the caller already holds one search_lock slot."""
+    print(f"[SEARCH QUEUE] {SERVER_ID} running search {row['id']} query={row['query']!r}")
+    last_write = [0.0]
+
+    def _progress(done, total):
+        now = time.time()
+        if now - last_write[0] >= SEARCH_PROGRESS_DB_INTERVAL:
+            last_write[0] = now
+            _search_progress_update(row["id"], done, total)
+
+    partial_written = [False]
+
+    def _partial(results):
+        if not partial_written[0]:
+            partial_written[0] = True
+            _search_partial_update(row["id"], _serialize_search_results(results))
+
+    try:
+        results, count = run_lncrawl_search(row["query"], on_progress=_progress, on_partial=_partial)
+        _search_log_finish(row["id"], _serialize_search_results(results), count)
+    except Exception as error:
+        print(f"[SEARCH QUEUE] search {row['id']} failed: {type(error).__name__}: {error}")
+        _search_log_finish(row["id"], status="failed", error=f"{type(error).__name__}: {error}")
+    finally:
+        search_lock.release()
+
+
+def process_search_queue_loop():
+    while True:
+        if not search_lock.acquire(blocking=False):
+            time.sleep(1.0)      # this server is busy with a search
+            continue
+        started = False
+        try:
+            row = _claim_search_request()
+            if row:
+                threading.Thread(target=_run_claimed_search, args=(row,), daemon=True).start()
+                started = True
+        except Exception as e:
+            print(f"[SEARCH QUEUE ERROR] {e}")
+        finally:
+            if not started:
+                search_lock.release()
+        if not started:
+            time.sleep(SEARCH_CLAIM_INTERVAL)
+
+
+def reap_orphaned_searches():
+    cycles = 0
+    while True:
+        conn = get_db_connection()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    # processing rows whose server died, restarted or hung
+                    cur.execute("""
+                        SELECT p.id, p.queued, p.attempts
+                        FROM search_requests p
+                        LEFT JOIN servers s ON s.server_id = p.server_id
+                        WHERE p.status = 'processing'
+                          AND (
+                              s.server_id IS NULL
+                              OR s.status = 'offline'
+                              OR s.run_id IS DISTINCT FROM p.run_id
+                              OR s.last_heartbeat < NOW() - INTERVAL '60 seconds'
+                              OR p.started_at < NOW() - INTERVAL '10 minutes'
+                          )
+                    """)
+                    for o in cur.fetchall():
+                        if o["queued"] and (o["attempts"] or 0) < 2:
+                            cur.execute("""
+                                UPDATE search_requests
+                                SET status = 'pending', server_id = NULL, run_id = NULL, started_at = NULL
+                                WHERE id = %s AND status = 'processing'
+                            """, (o["id"],))
+                        else:
+                            cur.execute("""
+                                UPDATE search_requests
+                                SET status = 'failed', error = 'worker lost', completed_at = NOW()
+                                WHERE id = %s AND status = 'processing'
+                            """, (o["id"],))
+                    # nobody is waiting for these anymore
+                    cur.execute("""
+                        UPDATE search_requests p
+                        SET status = 'abandoned', error = 'requester gone', completed_at = NOW()
+                        WHERE p.status = 'pending'
+                          AND (
+                              p.created_at < NOW() - make_interval(secs => %s)
+                              OR EXISTS (
+                                  SELECT 1 FROM servers s
+                                  WHERE s.server_id = p.origin_server
+                                    AND s.run_id IS DISTINCT FROM p.origin_run_id
+                              )
+                          )
+                    """, (SEARCH_QUEUE_WAIT + 30,))
+                    cycles += 1
+                    if cycles % 240 == 1:   # roughly hourly
+                        cur.execute(
+                            "DELETE FROM search_requests WHERE created_at < NOW() - make_interval(days => %s)",
+                            (SEARCH_HISTORY_DAYS,),
+                        )
+                    conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[SEARCH REAPER ERROR] {e}")
+            finally:
+                conn.close()
+        time.sleep(15)
+
+
+if WORKER_ENABLED and ALLOWED_CRAWLER == "v4":
+    threading.Thread(target=process_search_queue_loop, daemon=True, name="search-queue").start()
+threading.Thread(target=reap_orphaned_searches, daemon=True, name="search-reaper").start()
 
 # ---------------------- BLOCK GROUP COMMANDS ----------------------
  
@@ -3619,32 +4335,14 @@ if SERVER_ID == "s4":
     # ---------------------- DOWNLOAD COMMAND ----------------------
 
     # ---------------------- /search ----------------------
-    SEARCH_LIMIT = 10
-    SEARCH_CONCURRENCY = 15
-    SEARCH_TIMEOUT = 60
+    # SEARCH_LIMIT / SEARCH_CONCURRENCY / SEARCH_TIMEOUT / search_lock and
+    # run_lncrawl_search now live at module level (search queue section).
     SEARCH_PAGE_SIZE = 5
     SEARCH_SESSION_SECONDS = 600
-    search_lock = threading.Semaphore(2)
     search_sessions = {}
     active_search_sessions = {}
     search_session_lock = threading.Lock()
 
-    def run_lncrawl_search(query):
-        """Run the same source search used by the lncrawl CLI."""
-        ctx, _ = _v4()
-        ctx.setup()
-        ctx.sources.ensure_load()
-        from lncrawl.commands.search.helper import perform_search
-        sources = ctx.sources.list(None, can_search=True, include_rejected=False)
-        if not sources:
-            raise Exception("No searchable sources available")
-        return perform_search(
-            query=query,
-            sources=sources,
-            concurrency=SEARCH_CONCURRENCY,
-            limit=SEARCH_LIMIT,
-            timeout=SEARCH_TIMEOUT,
-        ), len(sources)
 
     def _search_key(chat_id, user_id):
         return chat_id, user_id
@@ -3744,15 +4442,22 @@ if SERVER_ID == "s4":
             print(f"[SEARCH MESSAGE ERROR] {error}")
 
     def _render_search_list(session):
+        if session.get("final_results") is not None:
+            session["results"] = session.pop("final_results")
+            session["page"] = 0
+        session["view"] = "list"
         page = session["page"]
         start = page * SEARCH_PAGE_SIZE
         entries = []
         for result_index, result in enumerate(session["results"][start:start + SEARCH_PAGE_SIZE], start=start + 1):
             entries.append(f"<b>{result_index}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))")
         text = "<b>Here are the novels I found for your query:</b>\n\n" + "\n\n".join(entries)
+        if session.get("searching"):
+            text += "\n\n🔄 Still searching more sources... this list will refresh when done."
         _search_edit(session, text, _search_markup(session, "list"))
 
     def _render_search_sources(session, result_index):
+        session["view"] = "sources"
         result = session["results"][result_index]
         lines = [f"<b>{result_index + 1}. {html.escape(result.title)}</b> ({len(result.novels)} source(s))"]
         for source_index, novel in enumerate(result.novels, start=1):
@@ -3766,6 +4471,7 @@ if SERVER_ID == "s4":
         result = session["results"][result_index]
         novel = result.novels[source_index]
         session["selection"] = (result_index, source_index)
+        session["view"] = "confirm"
         text = (
             "<b>Download this novel?</b>\n\n"
             f"{html.escape(result.title)}\n"
@@ -3773,37 +4479,117 @@ if SERVER_ID == "s4":
         )
         _search_edit(session, text, _search_markup(session, "confirm", result_index))
 
-    def _start_search(chat_id, user_id, query, mode="search"):
+    def _start_search(chat_id, user_id, query, mode="search", user=None):
         key = _search_key(chat_id, user_id)
         token = uuid.uuid4().hex[:12]
+        old_session = None
         with search_session_lock:
             old_token = active_search_sessions.get(key)
             if old_token:
-                search_sessions.pop(old_token, None)
+                old_session = search_sessions.pop(old_token, None)
             active_search_sessions[key] = token
-        threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token), daemon=True).start()
+        if old_session and old_session.get("message_id"):
+            try:
+                bot.delete_message(old_session["chat_id"], old_session["message_id"])
+            except Exception:
+                pass
+        threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token, user), daemon=True).start()
 
-    def _search_worker(chat_id, user_id, query, mode, token):
+    def _search_progress_text(query, info):
+        head = f"Searching for {query}..."
+        if info.get("phase") == "queued":
+            return f"{head}\n\nWaiting for a free server..."
+        done, total = info.get("done") or 0, info.get("total") or 0
+        if not total:
+            return head
+        return f"{head}\n\nSearched {done}/{total} sources"
+
+    def _search_worker(chat_id, user_id, query, mode, token, user=None):
         searching_msg = safe_send_message(chat_id, f"Searching for {query}...")
+        state = {"last_edit": time.time(), "last_text": None, "session": None}
+
+        def _show_partial(partial):
+            """Turn the 'Searching...' message into the result list while slow sources finish."""
+            if not partial or not searching_msg or state["session"] is not None:
+                return
+            with search_session_lock:
+                if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
+                    return
+                session = {
+                    "token": token,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "query": query,
+                    "mode": mode,
+                    "results": partial,
+                    "page": 0,
+                    "expires": time.time() + SEARCH_SESSION_SECONDS,
+                    "message_id": searching_msg.message_id,
+                    "searching": True,
+                    "view": "list",
+                }
+                search_sessions[token] = session
+            state["session"] = session
+            _render_search_list(session)
+            threading.Thread(target=_expire_search_session, args=(token,), daemon=True).start()
+
+        def _finish_partial(final_results):
+            """The search ended after early results were shown: swap in the final list."""
+            session = state["session"]
+            with search_session_lock:
+                if active_search_sessions.get(_search_key(chat_id, user_id)) != token or token not in search_sessions:
+                    return
+            session["searching"] = False
+            if final_results:
+                if session.get("view", "list") == "list":
+                    session["results"] = final_results
+                    session["page"] = 0
+                else:
+                    session["final_results"] = final_results   # applied when they go back to the list
+            if session.get("view", "list") == "list":
+                _render_search_list(session)
+
+        def progress_cb(info):
+            now = time.time()
+            if "partial" in info:
+                _show_partial(info["partial"])
+                return
+            if state["session"] is not None or not searching_msg or now - state["last_edit"] < SEARCH_PROGRESS_INTERVAL:
+                return
+            text = _search_progress_text(query, info)
+            if text == state["last_text"]:
+                return
+            state["last_edit"] = now
+            state["last_text"] = text
+            try:
+                bot.edit_message_text(text, chat_id, searching_msg.message_id)
+            except Exception:
+                pass
+
         try:
-            with search_lock:
-                results, source_count = run_lncrawl_search(query)
+            results, source_count = run_search_request(chat_id, user_id, user, query, mode, progress_cb=progress_cb)
         except Exception as error:
+            if state["session"] is not None:
+                _finish_partial(None)      # keep the early list, just stop the 'still searching' note
+                return
             print(f"[SEARCH ERROR] user={user_id} query={query!r}: {type(error).__name__}: {error}")
             send_temp_message(chat_id, f"Search failed: {type(error).__name__}: {error}", user_id)
             return
         finally:
-            if searching_msg:
+            if searching_msg and state["session"] is None:
                 try:
                     bot.delete_message(chat_id, searching_msg.message_id)
                 except Exception:
                     pass
+        print(f"[SEARCH] user={user_id} query={query!r} -> {len(results)} result(s) from {source_count} sources")
+        if state["session"] is not None:
+            _finish_partial(results)
+            return
         with search_session_lock:
             if active_search_sessions.get(_search_key(chat_id, user_id)) != token:
                 return
             if not results:
                 active_search_sessions.pop(_search_key(chat_id, user_id), None)
-        print(f"[SEARCH] user={user_id} query={query!r} -> {len(results)} result(s) from {source_count} sources")
         if not results:
             send_temp_message(chat_id, f"No results found for {query}.\nTry a shorter or different name.", user_id)
             return
@@ -3817,6 +4603,7 @@ if SERVER_ID == "s4":
             "page": 0,
             "expires": time.time() + SEARCH_SESSION_SECONDS,
             "message_id": None,
+            "view": "list",
         }
         with search_session_lock:
             search_sessions[token] = session
@@ -3835,7 +4622,7 @@ if SERVER_ID == "s4":
         if len(query) < 2:
             send_temp_message(chat_id, "The name must be at least 2 characters. Send /search to try again.", user_id)
             return
-        _start_search(chat_id, user_id, query)
+        _start_search(chat_id, user_id, query, user=message.from_user)
 
     @bot.message_handler(commands=['search'])
     def search_novels(message):
@@ -3879,9 +4666,9 @@ if SERVER_ID == "s4":
                 return
             result_index, source_index = selected
             novel = session["results"][result_index].novels[source_index]
-            _close_search_session(token)
+            _close_search_session(token, delete_message=True)
             try:
-                bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+                bot.delete_message(call.message.chat.id, call.message.message_id)
             except Exception:
                 pass
             bot.answer_callback_query(call.id, "Starting scan...")
@@ -4128,14 +4915,22 @@ if SERVER_ID == "s4":
 
         pending_format_state.pop(user_id, None)
         try:
-            bot.edit_message_text(
-                f"📦 Format: {output_format_label(choice)}",
-                chat_id,
-                call.message.message_id,
-                reply_markup=None,
-            )
+            bot.delete_message(chat_id, call.message.message_id)
         except Exception:
-            pass
+            try:
+                bot.edit_message_text(
+                    f"📦 Format: {output_format_label(choice)}",
+                    chat_id,
+                    call.message.message_id,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            threading.Thread(
+                target=delete_message_later,
+                args=(chat_id, call.message.message_id, 30),
+                daemon=True,
+            ).start()
         bot.answer_callback_query(call.id)
 
         insert_task_direct(
@@ -4166,7 +4961,7 @@ if SERVER_ID == "s4":
             if len(value) < 2:
                 send_temp_message(chat_id, "? Enter a valid URL or a novel name with at least 2 characters.", user_id)
                 return
-            _start_search(chat_id, user_id, value, mode="download")
+            _start_search(chat_id, user_id, value, mode="download", user=message.from_user)
             return
         _start_url_scan(message, value, version, message.from_user)
 
@@ -4497,6 +5292,155 @@ if SERVER_ID == "s4":
         finally:
             conn.close()
 
+
+    @bot.message_handler(commands=['searches'])
+    def searches(message):
+        # Admin only, same as /logs. Usage: /searches [count | user_id | @username]
+        if message.from_user.id not in ADMIN_USER_ID:
+            bot.send_message(message.chat.id, "❌ Access Denied.")
+            return
+
+        arg = ((message.text or "").split(maxsplit=1) + [""])[1].strip()
+        limit, where, params = 50, "", []
+        if arg:
+            if arg.isdigit() and len(arg) <= 4:
+                limit = max(1, min(int(arg), 200))
+            elif arg.isdigit():
+                where, params = "WHERE user_id = %s", [int(arg)]
+            else:
+                where, params = "WHERE LOWER(username) = LOWER(%s)", [arg.lstrip("@")]
+
+        conn = get_db_connection()
+        if not conn:
+            send_temp_message(
+                message.chat.id,
+                "⚠️ Cannot connect to Database. If the error persists, contact support. https://t.me/patiorjunrick004",
+                message.from_user.id
+            )
+            return
+
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) AS total, COUNT(DISTINCT user_id) AS users FROM search_requests {where}", params)
+                summary = cur.fetchone()
+                cur.execute(f"""
+                    SELECT id, user_id, username, first_name, last_name, query, mode,
+                           status, queued, server_id, origin_server, source_count,
+                           result_count, results, error, attempts, cached,
+                           created_at, started_at, completed_at
+                    FROM search_requests
+                    {where}
+                    ORDER BY id DESC
+                    LIMIT %s
+                """, params + [limit])
+                rows = list(reversed(cur.fetchall()))
+
+            if not rows:
+                send_temp_message(message.chat.id, "ℹ️ No search logs found.", message.from_user.id)
+                return
+
+            text = (
+                f"🔎 Search Logs (showing last {len(rows)} of {summary['total']}, "
+                f"{summary['users']} user(s))\n\n"
+            )
+            for t in rows:
+                username = f"@{t['username']}" if t['username'] else "N/A"
+                first = t['first_name'] or "N/A"
+                last = t['last_name'] or "N/A"
+                if t['cached']:
+                    how = "served from cache"
+                elif t['queued']:
+                    how = f"queued via DB (asked on {t['origin_server']})"
+                else:
+                    how = "ran on the requesting server"
+                titles = []
+                if isinstance(t['results'], list):
+                    titles = [r.get('title', '') for r in t['results'][:3]]
+                duration = "N/A"
+                if t['started_at'] and t['completed_at']:
+                    duration = f"{(t['completed_at'] - t['started_at']).total_seconds():.1f}s"
+                waited = ""
+                if t['queued'] and t['started_at']:
+                    waited = f" (waited {(t['started_at'] - t['created_at']).total_seconds():.1f}s)"
+
+                text += (
+                    f"🆔 Search ID: {t['id']}\n"
+                    f"👤 User ID: {t['user_id']}\n"
+                    f"🔗 Username: {username}\n"
+                    f"📛 Name: {first} {last}\n"
+                    f"🔎 Query: {t['query']}\n"
+                    f"🧭 Mode: {t['mode']}\n"
+                    f"🖥 Server: {t['server_id'] or 'N/A'} - {how}{waited}\n"
+                    f"📌 Status: {t['status']}\n"
+                    f"📊 Sources: {t['source_count'] if t['source_count'] is not None else 'N/A'}"
+                    f" | Results: {t['result_count'] if t['result_count'] is not None else 'N/A'}\n"
+                    + (f"📚 Top: {'; '.join(titles)}\n" if titles else "")
+                    + (f"❗ Error: {t['error']}\n" if t['error'] else "")
+                    + f"⏱ Duration: {duration}\n"
+                    f"🕒 Created: {t['created_at']}\n"
+                    f"▶️ Started: {t['started_at']}\n"
+                    f"✅ Completed: {t['completed_at']}\n"
+                    f"-----------------------------\n"
+                )
+
+            send_temp_long_message(message.chat.id, text, message.from_user.id)
+        except Exception as e:
+            conn.rollback()
+            print(f"[SEARCHES CMD ERROR] {e}")
+            send_temp_message(message.chat.id, f"⚠️ Could not load search logs: {e}", message.from_user.id)
+        finally:
+            conn.close()
+
+    @bot.message_handler(commands=['deadsources'])
+    def deadsources(message):
+        # Admin only. /deadsources lists dropped / at-risk sources.
+        # /deadsources reset [text] clears them (all, or URLs containing text).
+        if message.from_user.id not in ADMIN_USER_ID:
+            bot.send_message(message.chat.id, "❌ Access Denied.")
+            return
+        parts = (message.text or "").split(maxsplit=2)
+        conn = get_db_connection()
+        if not conn:
+            send_temp_message(message.chat.id, "⚠️ Cannot connect to DB", message.from_user.id)
+            return
+        try:
+            with conn.cursor() as cur:
+                if len(parts) >= 2 and parts[1].lower() == "reset":
+                    pattern = f"%{parts[2].strip()}%" if len(parts) > 2 else "%"
+                    cur.execute("""
+                        UPDATE search_source_health
+                        SET dns_failures = 0, dropped = FALSE, dropped_at = NULL
+                        WHERE url ILIKE %s
+                    """, (pattern,))
+                    changed = cur.rowcount
+                    conn.commit()
+                    _dropped_cache["at"] = 0.0
+                    send_temp_message(message.chat.id, f"✅ Reset {changed} source(s).", message.from_user.id)
+                    return
+                cur.execute("""
+                    SELECT url, dns_failures, dropped, dropped_at, last_error
+                    FROM search_source_health
+                    WHERE dns_failures > 0
+                    ORDER BY dropped DESC, dns_failures DESC, url
+                """)
+                rows = cur.fetchall()
+            if not rows:
+                send_temp_message(message.chat.id, "ℹ️ No failing sources recorded.", message.from_user.id)
+                return
+            dropped = [r for r in rows if r['dropped']]
+            risk = [r for r in rows if not r['dropped']]
+            text = f"🚫 Dropped sources ({len(dropped)}) - retried after {SOURCE_RETRY_DAYS} days:\n"
+            for r in dropped:
+                text += f"{r['url']} - {r['dns_failures']} DNS failures, dropped {r['dropped_at']}\n"
+            text += f"\n⚠️ At risk ({len(risk)}) - dropped after {SOURCE_DROP_AFTER} in a row:\n"
+            for r in risk:
+                text += f"{r['url']} - {r['dns_failures']}/{SOURCE_DROP_AFTER}\n"
+            send_temp_long_message(message.chat.id, text, message.from_user.id)
+        except Exception as e:
+            conn.rollback()
+            send_temp_message(message.chat.id, f"⚠️ Failed: {e}", message.from_user.id)
+        finally:
+            conn.close()
 
     @bot.message_handler(commands=['servers'])
     def list_servers(message):
