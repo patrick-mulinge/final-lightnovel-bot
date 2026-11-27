@@ -2066,7 +2066,7 @@ threading.Thread(target=reap_orphaned_previews, daemon=True).start()
 # writes the search to the search_requests table instead; any v4 server
 # (including s4 once a slot frees up) claims pending rows, runs the search and
 # stores the results as JSON. s4 polls its own row and builds the session.
-SEARCH_LIMIT = 10
+SEARCH_LIMIT = None           # None = keep every result found (set a number to cap the list)
 SEARCH_CONCURRENCY = 15
 SEARCH_TIMEOUT = 30           # seconds a whole search may run
 # searches one server runs at once: 3 on the polling server (s4), 2 on the others
@@ -4444,7 +4444,6 @@ if SERVER_ID == "s4":
     def _render_search_list(session):
         if session.get("final_results") is not None:
             session["results"] = session.pop("final_results")
-            session["page"] = 0
         session["view"] = "list"
         page = session["page"]
         start = page * SEARCH_PAGE_SIZE
@@ -4533,6 +4532,14 @@ if SERVER_ID == "s4":
             _render_search_list(session)
             threading.Thread(target=_expire_search_session, args=(token,), daemon=True).start()
 
+        def _merge_results(shown, final):
+            """Keep every title the user already saw in place (with any new sources
+            added), then append the titles found later."""
+            final_by_id = {r.id: r for r in final}
+            merged = [final_by_id.pop(r.id, r) for r in shown]
+            merged += [r for r in final if r.id in final_by_id]
+            return merged
+
         def _finish_partial(final_results):
             """The search ended after early results were shown: swap in the final list."""
             session = state["session"]
@@ -4541,11 +4548,11 @@ if SERVER_ID == "s4":
                     return
             session["searching"] = False
             if final_results:
+                merged = _merge_results(session["results"], final_results)
                 if session.get("view", "list") == "list":
-                    session["results"] = final_results
-                    session["page"] = 0
+                    session["results"] = merged
                 else:
-                    session["final_results"] = final_results   # applied when they go back to the list
+                    session["final_results"] = merged   # applied when they go back to the list
             if session.get("view", "list") == "list":
                 _render_search_list(session)
 
