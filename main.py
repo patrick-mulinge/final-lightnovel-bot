@@ -529,6 +529,10 @@ def setup_search_table():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            cur.execute("ALTER TABLE search_source_health ADD COLUMN IF NOT EXISTS priority_tier INT;")
+            cur.execute("ALTER TABLE search_source_health ADD COLUMN IF NOT EXISTS reply_seconds REAL;")
+            cur.execute("ALTER TABLE search_source_health ADD COLUMN IF NOT EXISTS result_count INT;")
+            cur.execute("ALTER TABLE search_source_health ADD COLUMN IF NOT EXISTS last_probe_at TIMESTAMP;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS search_test_reports (
                     id SERIAL PRIMARY KEY,
@@ -2600,8 +2604,94 @@ def _record_source_health(outcomes):
         conn.close()
 
 
+# Lower number = gets a search slot first.
+# 0 answered with results (fastest first), 1 never measured, 2 answered with nothing,
+# 3 error, 4 started but never replied, 5 never got a slot on the last full probe.
+_priority_cache = {"at": 0.0, "rows": {}}
+SEARCH_PROBE_QUERY = "the"
+SEARCH_PROBE_INTERVAL = 24 * 3600
+
+
+def _load_source_priority():
+    """url -> (tier, reply_seconds). Cached for a minute. Missing url means tier 1."""
+    if time.time() - _priority_cache["at"] < 60:
+        return _priority_cache["rows"]
+    conn = get_db_connection()
+    if not conn:
+        return _priority_cache["rows"]
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT url, priority_tier, reply_seconds
+                FROM search_source_health
+                WHERE priority_tier IS NOT NULL
+            """)
+            _priority_cache["rows"] = {
+                row["url"]: (int(row["priority_tier"]), float(row["reply_seconds"] or 0))
+                for row in cur.fetchall()
+            }
+            _priority_cache["at"] = time.time()
+    except Exception as error:
+        print(f"[SEARCH PRIORITY] load failed: {error}")
+    finally:
+        conn.close()
+    return _priority_cache["rows"]
+
+
+def _sort_sources_by_priority(sources):
+    """Proven fast hits first. lncrawl's own order is kept inside one tier."""
+    stats = _load_source_priority()
+    sources.sort(key=lambda source: stats.get(source.url, (1, 0.0)))
+    return sources
+
+
+def _update_source_priority(timings, hanging=None, never=None, mark_unreached=False):
+    """Remember how each source behaved. A short search must not punish sources that never started."""
+    rows = []
+    for url, timing in (timings or {}).items():
+        duration = max(0.0, float(timing.get("end") or 0) - float(timing.get("start") or 0))
+        count = int(timing.get("count") or 0)
+        if timing.get("status") == "ok" and count > 0:
+            tier = 0
+        elif timing.get("status") == "ok":
+            tier = 2
+        else:
+            tier = 3
+        rows.append((url, tier, duration, count))
+    if mark_unreached:
+        for url in hanging or []:
+            rows.append((url, 4, 9999.0, 0))
+        for url in never or []:
+            rows.append((url, 5, 9999.0, 0))
+    if not rows:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO search_source_health
+                    (url, priority_tier, reply_seconds, result_count, last_probe_at, updated_at)
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (url) DO UPDATE SET
+                    priority_tier = EXCLUDED.priority_tier,
+                    reply_seconds = EXCLUDED.reply_seconds,
+                    result_count = EXCLUDED.result_count,
+                    last_probe_at = NOW(),
+                    updated_at = NOW()
+            """, rows)
+        conn.commit()
+        _priority_cache["at"] = 0.0
+    except Exception as error:
+        conn.rollback()
+        print(f"[SEARCH PRIORITY] update failed: {error}")
+    finally:
+        conn.close()
+
+
 def _perform_search_with_progress(query, sources, limit, concurrency, timeout, on_progress=None, on_partial=None,
-                                  cancel_event=None, user_deadline=None, on_final=None, report_out=None):
+                                  cancel_event=None, user_deadline=None, on_final=None, report_out=None, update_priority=False):
     """lncrawl's perform_search plus: on_progress(done, total) every ~2s, one early
     on_partial(results) at each SEARCH_PARTIAL_TIMES mark (50s, 70s), and per-source health tracking.
     cancel_event: set it to abort. user_deadline + on_final(results, total): test mode, where `timeout` is longer than
@@ -2704,11 +2794,20 @@ def _perform_search_with_progress(query, sources, limit, concurrency, timeout, o
             query, [src.url for src in sources], timings, starts, time.time() - t0, timeout, user_deadline,
         ))
     threading.Thread(target=_record_source_health, args=(dict(outcomes),), daemon=True).start()
+    if update_priority:
+        # Only a probe changes priorities. A normal or /testsearches search is about one query,
+        # so "no results" there says nothing about whether a source is healthy.
+        _update_source_priority(
+            timings,
+            hanging=[url for url in starts if url not in timings],
+            never=[src.url for src in sources if src.url not in starts],
+            mark_unreached=True,
+        )
     return _combine_search_records(records, query, limit)
 
 
 def run_lncrawl_search(query, on_progress=None, on_partial=None, cancel_event=None, on_final=None,
-                       test_timeout=None, report_out=None):
+                       test_timeout=None, report_out=None, update_priority=False):
     """Run the same source search used by the lncrawl CLI."""
     ctx, _ = _v4()
     ctx.setup()
@@ -2727,6 +2826,7 @@ def run_lncrawl_search(query, on_progress=None, on_partial=None, cancel_event=No
             sources = kept
     if not sources:
         raise Exception("No searchable sources available")
+    _sort_sources_by_priority(sources)
     extended = test_timeout if (test_timeout and test_timeout > SEARCH_TIMEOUT) else None
     return _perform_search_with_progress(
         query, sources, SEARCH_LIMIT, SEARCH_CONCURRENCY, extended or SEARCH_TIMEOUT, on_progress, on_partial,
@@ -2734,6 +2834,7 @@ def run_lncrawl_search(query, on_progress=None, on_partial=None, cancel_event=No
         user_deadline=SEARCH_TIMEOUT if extended else None,
         on_final=on_final if extended else None,
         report_out=report_out,
+        update_priority=update_priority,
     ), len(sources)
 
 
@@ -3493,6 +3594,67 @@ def reap_orphaned_searches():
 if WORKER_ENABLED and ALLOWED_CRAWLER == "v4":
     threading.Thread(target=process_search_queue_loop, daemon=True, name="search-queue").start()
 threading.Thread(target=reap_orphaned_searches, daemon=True, name="search-reaper").start()
+
+
+def _run_search_probe():
+    """One probe: search "the" for up to 10 minutes, save a report, update every source's priority."""
+    print(f"[SEARCH PROBE] {SERVER_ID} probing {SEARCH_PROBE_QUERY!r}")
+    report = {}
+    run_lncrawl_search(
+        SEARCH_PROBE_QUERY,
+        test_timeout=SEARCH_TEST_MAX_SECONDS,
+        report_out=report,
+        update_priority=True,
+    )
+    if report:
+        report["probe"] = True
+        _save_search_test_report(None, SEARCH_PROBE_QUERY, report)
+    _api_setting_set("search_probe_at", str(time.time()))
+    print(
+        f"[SEARCH PROBE] recorded {len(report.get('sources', []))} answers, "
+        f"{len(report.get('never_started', []))} never started"
+    )
+
+
+def _daily_search_probe_loop():
+    """s4 runs a probe when 24 hours have passed since the last one, or when an admin asks
+    with /testsearches probe (that sets search_probe_request). A probe always runs the full
+    10 minutes, holds one search slot, and does not need /testsearches to be on."""
+    time.sleep(90)
+    while True:
+        try:
+            def _num(key):
+                try:
+                    return float(_api_setting_get(key, "0") or 0)
+                except ValueError:
+                    return 0.0
+            last = _num("search_probe_at")
+            requested = _num("search_probe_request")
+            due = (not last) or time.time() - last >= SEARCH_PROBE_INTERVAL
+            asked = requested > last
+            if not (due or asked):
+                time.sleep(10)
+                continue
+            if not search_lock.acquire(blocking=False):
+                time.sleep(15)
+                continue
+            try:
+                _api_setting_set("search_probe_running", str(time.time()))
+                try:
+                    _run_search_probe()
+                finally:
+                    _api_setting_set("search_probe_running", "0")
+            finally:
+                search_lock.release()
+        except Exception as error:
+            print(f"[SEARCH PROBE] {error}")
+            time.sleep(60)
+            continue
+        time.sleep(10)
+
+
+if SERVER_ID == "s4" and WORKER_ENABLED and ALLOWED_CRAWLER == "v4":
+    threading.Thread(target=_daily_search_probe_loop, daemon=True, name="search-probe").start()
 
 # ---------------------- BLOCK GROUP COMMANDS ----------------------
  
@@ -6557,6 +6719,26 @@ if SERVER_ID == "s4":
             safe_send_message(chat_id, "🧪 Test searches are OFF. Searches stop at the normal timeout again.")
             return
 
+        if arg == "probe":
+            try:
+                running = float(_api_setting_get("search_probe_running", "0") or 0)
+            except ValueError:
+                running = 0
+            if running and time.time() - running < SEARCH_TEST_MAX_SECONDS + 300:
+                safe_send_message(chat_id, f"🧪 A probe is already running (started {_format_age(time.time() - running)} ago). "
+                                           "It updates the priorities when it finishes.")
+                return
+            if not _api_setting_set("search_probe_request", str(time.time())):
+                safe_send_message(chat_id, "❌ Database error. Probe was not requested.")
+                return
+            safe_send_message(
+                chat_id,
+                f"🧪 Probe requested. s4 starts it within about 15 seconds, searches \"{SEARCH_PROBE_QUERY}\" for up to "
+                f"{SEARCH_TEST_MAX_SECONDS // 60} minutes, then updates the source priorities and saves a report. "
+                "It holds one search slot meanwhile. Read it with /testsearches report.",
+            )
+            return
+
         if arg.startswith("report"):
             rest = arg[len("report"):].strip()
             rows = _load_search_test_reports(report_id=int(rest)) if rest.isdigit() else _load_search_test_reports(limit=1)
@@ -6587,7 +6769,7 @@ if SERVER_ID == "s4":
             return
 
         if arg:
-            safe_send_message(chat_id, "Usage: /testsearches on | off | <time, e.g. 2 minutes> | report [number]")
+            safe_send_message(chat_id, "Usage: /testsearches on | off | <time, e.g. 2 minutes> | report [number] | probe")
             return
 
         lines = [_test_status_text(), ""]
@@ -6597,7 +6779,8 @@ if SERVER_ID == "s4":
             for row in rows:
                 ok, late, slowest, deadline = _report_stats(row["data"])
                 slow_text = f"{slowest['end']}s" if slowest else "none"
-                lines.append(f"#{row['id']}  {row['query']}  -  {len(late)} answer(s) after {deadline:.0f}s, slowest {slow_text}")
+                tag = "  [probe]" if (row["data"] or {}).get("probe") else ""
+                lines.append(f"#{row['id']}  {row['query']}  -  {len(late)} answer(s) after {deadline:.0f}s, slowest {slow_text}{tag}")
         else:
             lines.append("No test reports yet. Turn test mode on with /testsearches on, then run a search.")
         lines += [
@@ -6606,6 +6789,8 @@ if SERVER_ID == "s4":
             f"/testsearches 2 minutes - choose the length (up to {SEARCH_TEST_MAX_SECONDS // 60} minutes)",
             "/testsearches off",
             "/testsearches report [number] - full report, default is the latest",
+            f"/testsearches probe - search \"{SEARCH_PROBE_QUERY}\" for {SEARCH_TEST_MAX_SECONDS // 60} minutes now and update source priorities "
+            "(only a probe changes priorities; it also runs by itself every 24 hours)",
         ]
         _send_in_chunks(chat_id, "\n".join(lines))
 
