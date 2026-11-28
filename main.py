@@ -529,6 +529,16 @@ def setup_search_table():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS search_test_reports (
+                    id SERIAL PRIMARY KEY,
+                    search_id INT,
+                    query TEXT,
+                    timeout_seconds INT,
+                    data JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_search_requests_status ON search_requests (status, id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_search_requests_created ON search_requests (created_at);")
             conn.commit()
@@ -2068,7 +2078,7 @@ threading.Thread(target=reap_orphaned_previews, daemon=True).start()
 # stores the results as JSON. s4 polls its own row and builds the session.
 SEARCH_LIMIT = None           # None = keep every result found (set a number to cap the list)
 SEARCH_CONCURRENCY = 10
-SEARCH_TIMEOUT = 120          # seconds a whole search may run (slow sources get this long)
+SEARCH_TIMEOUT = 90           # seconds a user waits for the final list (the search is cut off here unless /testsearches is on)
 # searches one server runs at once: 2 on every server (override with the SEARCH_SLOTS env variable)
 SEARCH_SLOTS = max(1, int(os.getenv("SEARCH_SLOTS", "2")))
 SEARCH_QUEUE_WAIT = SEARCH_TIMEOUT + 240   # seconds the requester waits for a queued search (grows with SEARCH_TIMEOUT)
@@ -2076,11 +2086,16 @@ SEARCH_POLL_INTERVAL = 3.0     # s4 checking its queued row
 SEARCH_CLAIM_INTERVAL = 5.0    # idle servers checking the queue
 SEARCH_PROGRESS_INTERVAL = 7  # seconds between progress edits sent to the user
 SEARCH_PROGRESS_DB_INTERVAL = 4  # seconds between progress writes by a worker
-SEARCH_CACHE_SECONDS = 900     # identical queries inside this window reuse the earlier results
-SEARCH_PARTIAL_TIMES = (60, 90)  # seconds into a search when an interim list is shown; the final list arrives when the search ends
+SEARCH_CACHE_SECONDS = 86400   # identical queries inside this window (24 hours) reuse the earlier results; the list then offers a Refresh button
+SEARCH_PARTIAL_TIMES = (50, 70)  # seconds into a search when an interim list is shown; the final list arrives at SEARCH_TIMEOUT
 RESULTS_PER_PAGE = 10          # novels shown per page in /search results. Change this one number to resize pages.
-SEARCH_ETA_TEXT = "Search will take 1-2 minutes"   # line shown under "Searching for ..." while sources are scanned
-SEARCH_STILL_TEXT = f"🔄 Still searching more sources... the final list will be provided within {max(1, round(SEARCH_TIMEOUT / 60))} minutes."
+SEARCH_ETA_TEXT = f"Search will take up to {SEARCH_TIMEOUT} seconds"   # line shown under "Searching for ..." while sources are scanned
+SEARCH_STILL_TEXT = f"🔄 Still searching more sources... the final list will be provided within {SEARCH_TIMEOUT} seconds."
+SEARCH_CACHED_TEXT = "ℹ️ These are saved results from the same search made {age} ago, so they may be outdated. Tap Refresh search results below to search again for fresh results."
+# /testsearches: users still get their lists on the normal schedule, but the search itself keeps running this long
+SEARCH_TEST_DEFAULT_SECONDS = 300
+SEARCH_TEST_MAX_SECONDS = 600
+SEARCH_TEST_AUTO_OFF_SECONDS = 1800   # test mode switches itself off after this long, in case it is left on
 SOURCE_DROP_AFTER = 5          # searches in a row a site must fail DNS before it is dropped
 SOURCE_RETRY_DAYS = 3          # a dropped site is tried again after this many days
 _dropped_cache = {"at": 0.0, "urls": set()}
@@ -2099,9 +2114,34 @@ def _classify_search_error(error):
     return "dns" if any(m in text for m in SEARCH_DNS_MARKERS) else "other"
 
 
+class SearchCancelled(Exception):
+    """The user pressed Cancel (or started another search) while this one was running."""
+
+
 def _norm_search_text(text):
     """Lowercase, drop punctuation, collapse spaces: "Mad-God's Return!" -> "mad god s return"."""
     return re.sub(r"[\W_]+", " ", str(text or "").lower()).strip()
+
+
+def _tier_of(t, q, q_words):
+    """How closely a normalised title t matches a normalised query q: 0 exact, 1 starts with, 2 contains the
+    phrase, 3 has every word, 4 anything else."""
+    if not q:
+        return 4
+    if t == q:
+        return 0
+    if t.startswith(q + " "):
+        return 1
+    if f" {q} " in f" {t} ":
+        return 2
+    if q_words <= set(t.split()):
+        return 3
+    return 4
+
+
+def _title_tier(title, query):
+    q = _norm_search_text(query)
+    return _tier_of(_norm_search_text(title), q, set(q.split()))
 
 
 def _rank_search_results(results, query):
@@ -2122,16 +2162,7 @@ def _rank_search_results(results, query):
 
     def _key(result):
         t = _norm_search_text(result.title)
-        if t == q:
-            tier = 0
-        elif t.startswith(q + " "):
-            tier = 1
-        elif f" {q} " in f" {t} ":
-            tier = 2
-        elif q_words <= set(t.split()):
-            tier = 3
-        else:
-            tier = 4
+        tier = _tier_of(t, q, q_words)
         ratio = SequenceMatcher(a=t, b=q).ratio()
         return (tier, -ratio, -len(result.novels))
 
@@ -2221,23 +2252,40 @@ def _record_source_health(outcomes):
         conn.close()
 
 
-def _perform_search_with_progress(query, sources, limit, concurrency, timeout, on_progress=None, on_partial=None):
+def _perform_search_with_progress(query, sources, limit, concurrency, timeout, on_progress=None, on_partial=None,
+                                  cancel_event=None, user_deadline=None, on_final=None, report_out=None):
     """lncrawl's perform_search plus: on_progress(done, total) every ~2s, one early
-    on_partial(results) at each SEARCH_PARTIAL_TIMES mark (60s, 90s), and per-source health tracking."""
+    on_partial(results) at each SEARCH_PARTIAL_TIMES mark (50s, 70s), and per-source health tracking.
+    cancel_event: set it to abort. user_deadline + on_final(results, total): test mode, where `timeout` is longer than
+    what users wait. report_out: a dict that receives the per-source timing report."""
     from concurrent.futures import TimeoutError as FutureTimeout
     from threading import Event
     from lncrawl.core import TaskManager
     from lncrawl.commands.search.helper import search_job
 
     outcomes = {}
+    timings = {}     # per source: when it started, when it answered, what it returned (used by /testsearches)
+    starts = {}
+    t0 = time.time()
 
     def _job(source, q, sig, tmo):
+        began = time.time() - t0
+        starts[source.url] = began
         try:
             result = search_job(source, q, sig, tmo)
         except Exception as e:
             outcomes[source.url] = _classify_search_error(e)
+            timings[source.url] = {
+                "start": began, "end": time.time() - t0, "status": outcomes[source.url],
+                "error": f"{type(e).__name__}: {str(e)[:120]}", "count": 0, "items": [],
+            }
             raise
         outcomes[source.url] = "ok"
+        found = list(result or [])
+        timings[source.url] = {
+            "start": began, "end": time.time() - t0, "status": "ok", "count": len(found),
+            "items": [(str(getattr(r, "title", "")), str(getattr(r, "url", ""))) for r in found[:8]],
+        }
         return result
 
     signal = Event()
@@ -2246,30 +2294,46 @@ def _perform_search_with_progress(query, sources, limit, concurrency, timeout, o
     total = len(futures)
     stop = Event()
     records = []
-    t0 = time.time()
     partial_sent = set()
+    final_sent = [False]
 
     def _monitor():
-        while not stop.wait(2.0):
+        last_progress = 0.0
+        while not stop.wait(1.0):
             try:
-                if on_progress:
+                now = time.time()
+                elapsed = now - t0
+                if on_progress and now - last_progress >= 2.0:
+                    last_progress = now
                     on_progress(sum(1 for f in futures if f.done()), total)
                 if on_partial and records:
-                    elapsed = time.time() - t0
                     due = [m for m in SEARCH_PARTIAL_TIMES if elapsed >= m and m not in partial_sent]
                     if due:
                         partial_sent.update(due)
                         on_partial(_combine_search_records(list(records), query, limit))
+                if on_final and user_deadline and not final_sent[0] and elapsed >= user_deadline:
+                    # Test mode: the user's list is final now; the search keeps running to collect late answers.
+                    final_sent[0] = True
+                    on_final(_combine_search_records(list(records), query, limit), total)
             except Exception:
                 pass
 
-    if on_progress or on_partial:
+    def _cancel_watch():
+        while not stop.is_set():
+            if cancel_event.wait(0.5):
+                signal.set()
+                taskman.cancel_futures(futures)   # lets the result loop below return at once
+                return
+
+    if on_progress or on_partial or on_final:
         if on_progress:
             try:
                 on_progress(0, total)
             except Exception:
                 pass
         threading.Thread(target=_monitor, daemon=True).start()
+    if cancel_event is not None:
+        threading.Thread(target=_cancel_watch, daemon=True).start()
 
     try:
         for result in taskman.resolve(
@@ -2285,11 +2349,18 @@ def _perform_search_with_progress(query, sources, limit, concurrency, timeout, o
         taskman.shutdown()
         stop.set()
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise SearchCancelled()
+    if report_out is not None:
+        report_out.update(_build_search_report(
+            query, [src.url for src in sources], timings, starts, time.time() - t0, timeout, user_deadline,
+        ))
     threading.Thread(target=_record_source_health, args=(dict(outcomes),), daemon=True).start()
     return _combine_search_records(records, query, limit)
 
 
-def run_lncrawl_search(query, on_progress=None, on_partial=None):
+def run_lncrawl_search(query, on_progress=None, on_partial=None, cancel_event=None, on_final=None,
+                       test_timeout=None, report_out=None):
     """Run the same source search used by the lncrawl CLI."""
     ctx, _ = _v4()
     ctx.setup()
@@ -2308,8 +2379,13 @@ def run_lncrawl_search(query, on_progress=None, on_partial=None):
             sources = kept
     if not sources:
         raise Exception("No searchable sources available")
+    extended = test_timeout if (test_timeout and test_timeout > SEARCH_TIMEOUT) else None
     return _perform_search_with_progress(
-        query, sources, SEARCH_LIMIT, SEARCH_CONCURRENCY, SEARCH_TIMEOUT, on_progress, on_partial,
+        query, sources, SEARCH_LIMIT, SEARCH_CONCURRENCY, extended or SEARCH_TIMEOUT, on_progress, on_partial,
+        cancel_event=cancel_event,
+        user_deadline=SEARCH_TIMEOUT if extended else None,
+        on_final=on_final if extended else None,
+        report_out=report_out,
     ), len(sources)
 
 
@@ -2432,17 +2508,17 @@ def _search_get(row_id, want_partial=False):
 
 
 def _unpack_partial(data):
-    """partial_results is stored as {"seq": n, "results": [...]}; returns (seq, results or None)."""
+    """partial_results is stored as {"seq": n, "results": [...], "final": bool}; returns (seq, results or None, is_final)."""
     if isinstance(data, str):
         try:
             data = json.loads(data)
         except Exception:
-            return 0, None
+            return 0, None, False
     if isinstance(data, dict):
-        return int(data.get("seq") or 0), data.get("results")
+        return int(data.get("seq") or 0), data.get("results"), bool(data.get("final"))
     if isinstance(data, list):
-        return 1, data
-    return 0, None
+        return 1, data, False
+    return 0, None, False
 
 
 def _search_partial_update(row_id, partial):
@@ -2464,14 +2540,16 @@ def _search_partial_update(row_id, partial):
 
 
 def _search_cache_lookup(query):
-    """A finished, non-empty, real (not itself cached) search for the same query in the last 15 min."""
+    """A finished, non-empty, real (not itself cached) search for the same query inside SEARCH_CACHE_SECONDS."""
     conn = get_db_connection()
     if not conn:
         return None
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT results, source_count FROM search_requests
+                SELECT results, source_count,
+                       EXTRACT(EPOCH FROM (NOW() - completed_at)) AS age_seconds
+                FROM search_requests
                 WHERE status = 'done' AND cached IS NOT TRUE
                   AND result_count > 0 AND results IS NOT NULL
                   AND LOWER(BTRIM(query)) = LOWER(BTRIM(%s))
@@ -2559,20 +2637,252 @@ def _search_abandon(row_id):
         conn.close()
 
 
-def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb=None):
-    """Used by s4's /search. Returns (results, source_count).
+def _search_cancel(row_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE search_requests
+                SET status = 'cancelled', error = 'cancelled by the user', completed_at = NOW()
+                WHERE id = %s AND status IN ('pending', 'processing')
+            """, (row_id,))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] cancel failed for {row_id}: {e}")
+    finally:
+        conn.close()
 
-    Same query within SEARCH_CACHE_SECONDS -> reuse the earlier results.
-    Free slot -> search right here. All slots busy -> queue the search in the
+
+def _search_is_cancelled(row_id):
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM search_requests WHERE id = %s", (row_id,))
+            row = cur.fetchone()
+            return bool(row and row["status"] == "cancelled")
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _format_age(seconds):
+    s = max(0, int(float(seconds or 0)))
+    if s < 60:
+        return "less than a minute"
+    if s < 3600:
+        n, unit = s // 60, "minute"
+    elif s < 86400:
+        n, unit = s // 3600, "hour"
+    else:
+        n, unit = s // 86400, "day"
+    return f"{n} {unit}{'' if n == 1 else 's'}"
+
+
+# ---- /testsearches -------------------------------------------------------------------------------------------
+_TIER_LABELS = ("exact", "starts with", "contains", "all words", "loose")
+
+
+def _search_test_timeout():
+    """Seconds a search may run while /testsearches is on, or None (off, expired or invalid)."""
+    raw = str(_api_setting_get("search_test", "") or "")
+    try:
+        seconds, until = raw.split("|")
+        seconds, until = float(seconds), float(until)
+    except ValueError:
+        return None
+    if until <= time.time() or seconds <= SEARCH_TIMEOUT:
+        return None
+    return min(seconds, SEARCH_TEST_MAX_SECONDS)
+
+
+def _search_test_set(seconds):
+    """seconds=None switches test mode off. Shared by every server through bot_settings."""
+    if not seconds:
+        return _api_setting_set("search_test", "")
+    return _api_setting_set("search_test", f"{int(seconds)}|{time.time() + SEARCH_TEST_AUTO_OFF_SECONDS}")
+
+
+def _build_search_report(query, source_urls, timings, starts, elapsed, timeout, user_deadline):
+    rows, hanging, never = [], [], []
+    for url in source_urls:
+        t = timings.get(url)
+        if t is None:
+            if url in starts:
+                hanging.append({"url": url, "start": round(starts[url], 1)})
+            else:
+                never.append({"url": url})
+            continue
+        rows.append({
+            "url": url,
+            "start": round(t["start"], 1),
+            "end": round(t["end"], 1),
+            "status": t["status"],
+            "error": t.get("error", ""),
+            "count": t.get("count", 0),
+            "items": [{"title": title, "url": link, "tier": _title_tier(title, query)} for title, link in t["items"]],
+        })
+    return {
+        "query": query,
+        "timeout": int(timeout),
+        "deadline": int(user_deadline or timeout),
+        "elapsed": round(elapsed, 1),
+        "total": len(source_urls),
+        "sources": rows,
+        "hanging": hanging,
+        "never_started": never,
+    }
+
+
+def _save_search_test_report(search_id, query, report):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO search_test_reports (search_id, query, timeout_seconds, data)
+                VALUES (%s, %s, %s, %s)
+            """, (search_id, query, report.get("timeout"), Json(report)))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"[SEARCH DB] test report save failed for {search_id}: {e}")
+    finally:
+        conn.close()
+
+
+def _load_search_test_reports(limit=10, report_id=None):
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            if report_id is None:
+                cur.execute("""
+                    SELECT id, search_id, query, created_at, data FROM search_test_reports
+                    ORDER BY id DESC LIMIT %s
+                """, (limit,))
+            else:
+                cur.execute("""
+                    SELECT id, search_id, query, created_at, data FROM search_test_reports WHERE id = %s
+                """, (report_id,))
+            return cur.fetchall()
+    except Exception as e:
+        print(f"[SEARCH DB] test report load failed: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def _report_stats(data):
+    deadline = float(data.get("deadline") or SEARCH_TIMEOUT)
+    ok = [r for r in data.get("sources", []) if r["status"] == "ok"]
+    late = [r for r in ok if r["end"] > deadline]
+    slowest = max(ok, key=lambda r: r["end"], default=None)
+    return ok, late, slowest, deadline
+
+
+def _format_test_report(report_id, search_id, data):
+    """Full text of one test search (the caller splits it into Telegram-sized messages)."""
+    ok, late, slowest, deadline = _report_stats(data)
+    rows = data.get("sources", [])
+    bad = [r for r in rows if r["status"] != "ok"]
+    hanging = data.get("hanging", [])
+    never = data.get("never_started", [])
+    query = data.get("query", "")
+    timeout = data.get("timeout")
+    elapsed = data.get("elapsed")
+    seen = {_norm_search_text(i["title"]) for r in ok if r["end"] <= deadline for i in r["items"]}
+    late = sorted(late, key=lambda r: r["end"])
+
+    lines = [
+        f"🧪 Test search #{report_id} (search log id {search_id})",
+        f"Query: {query}",
+        f"Users saw their final list at {deadline:.0f}s. This run waited up to {timeout}s and ended at {elapsed}s.",
+        "",
+        f"Sources: {data.get('total')} | answered {len(ok)} | errors {len(bad)} | still waiting at the end {len(hanging)} | never started {len(never)}",
+        f"Answered after {deadline:.0f}s: {len(late)}",
+    ]
+    if slowest:
+        lines.append(f"Slowest answer: {slowest['end']}s - {slowest['url']}")
+
+    if late:
+        lines.append("")
+        lines.append(f"⏱ Answers that came after {deadline:.0f}s (users never saw these):")
+        for r in late:
+            lines.append(f"\n{r['end']}s  {r['url']}  (started at {r['start']}s, {r['count']} result(s))")
+            for it in r["items"][:5]:
+                fresh = "new title" if _norm_search_text(it["title"]) not in seen else "extra source for a title users already had"
+                lines.append(f"  - {it['title']} - {it['url']}  [{_TIER_LABELS[it['tier']]}; {fresh}]")
+        close = [r for r in late if any(i["tier"] <= 2 for i in r["items"])]
+        new_titles = {_norm_search_text(i["title"]) for r in late for i in r["items"] if i["tier"] <= 2} - seen
+        lines.append("")
+        lines.append(
+            f"📊 Late sources with a close title match (exact, starts with or contains): {len(close)} of {len(late)}. "
+            f"Close-match titles that only late sources found: {len(new_titles)}."
+        )
+    else:
+        lines.append("")
+        lines.append(f"Nothing answered after {deadline:.0f}s, so the extra wait added no results this time.")
+    if slowest:
+        lines.append(f"⏳ A test timeout of about {int(slowest['end']) + 15}s would have been enough for this run.")
+
+    lines.append("")
+    lines.append("🐢 Slowest 10 answers:")
+    for r in sorted(ok, key=lambda r: r["end"], reverse=True)[:10]:
+        best = min((i["tier"] for i in r["items"]), default=None)
+        best_text = _TIER_LABELS[best] if best is not None else "no results"
+        lines.append(f"{r['end']}s  {r['url']}  {r['count']} result(s), best match: {best_text}")
+
+    if never:
+        lines.append("")
+        lines.append(
+            f"⏸ Never started ({len(never)}): they were still queued behind slow sources. "
+            "If this number is large, SEARCH_CONCURRENCY is the bottleneck, not the timeout."
+        )
+        lines.extend(f"  {r['url']}" for r in never[:12])
+    if hanging:
+        lines.append("")
+        lines.append(f"⌛ Started but never answered ({len(hanging)}):")
+        lines.extend(f"  {r['url']} (started at {r['start']}s)" for r in hanging[:12])
+    if bad:
+        lines.append("")
+        lines.append(f"⚠️ Errors ({len(bad)}):")
+        lines.extend(f"  {r['url']} - {r['status']}: {r['error'][:100]}" for r in bad[:12])
+    return "\n".join(lines)
+
+
+def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb=None,
+                       cancel_event=None, fresh=False, info=None):
+    """Used by s4's /search and /download. Returns (results, source_count).
+
+    Same query within SEARCH_CACHE_SECONDS -> reuse the earlier results (unless fresh=True), and info["cached"]
+    / info["cached_age"] say so. Free slot -> search right here. All slots busy -> queue the search in the
     DB and wait for whichever server claims it (possibly s4 itself).
-    progress_cb(info) gets {"phase": "queued"|"running", "done", "total", "ahead"}
-    and, once, {"phase": "running", "partial": [early results]}."""
-    cached = _search_cache_lookup(query)
-    if cached:
-        count = cached["source_count"] or 0
-        _search_log_cached(chat_id, user_id, user, query, mode, cached["results"], count)
-        print(f"[SEARCH] cache hit for user={user_id} query={query!r}")
-        return _deserialize_search_results(cached["results"]), count
+    progress_cb(info) gets {"phase": "queued"|"running", "done", "total", "ahead"} and, at the
+    SEARCH_PARTIAL_TIMES marks, {"phase": "running", "partial": [early results]}.
+    cancel_event aborts the search and raises SearchCancelled.
+    In /testsearches mode the list handed back is the one at SEARCH_TIMEOUT; the search keeps running in the
+    background, stores the late answers in the cache and writes a test report."""
+    if info is None:
+        info = {}
+    if not fresh:
+        cached = _search_cache_lookup(query)
+        if cached:
+            count = cached["source_count"] or 0
+            _search_log_cached(chat_id, user_id, user, query, mode, cached["results"], count)
+            info["cached"] = True
+            info["cached_age"] = float(cached.get("age_seconds") or 0)
+            print(f"[SEARCH] cache hit for user={user_id} query={query!r}")
+            return _deserialize_search_results(cached["results"]), count
+
+    test_timeout = _search_test_timeout()
 
     if search_lock.acquire(blocking=False):
         row_id = _search_log_insert(chat_id, user_id, user, query, mode, queued=False)
@@ -2580,35 +2890,68 @@ def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb
         if progress_cb:
             local_progress = lambda d, t: progress_cb({"phase": "running", "done": d, "total": t})
             local_partial = lambda res: progress_cb({"phase": "running", "partial": res})
-        try:
-            results, count = run_lncrawl_search(query, on_progress=local_progress, on_partial=local_partial)
-        except Exception as error:
-            search_lock.release()
-            _search_log_finish(row_id, status="failed", error=f"{type(error).__name__}: {error}")
-            raise
-        search_lock.release()
-        try:
-            _search_log_finish(row_id, _serialize_search_results(results), count)
-        except Exception as e:
-            print(f"[SEARCH DB] could not log results for {row_id}: {e}")
-        return results, count
+        outcome = {}
+        ready = threading.Event()
+        report = {} if test_timeout else None
+
+        def _on_final(res, total):
+            outcome.setdefault("final", (res, total))
+            ready.set()
+
+        def _runner():
+            try:
+                results, count = run_lncrawl_search(
+                    query, on_progress=local_progress, on_partial=local_partial, cancel_event=cancel_event,
+                    on_final=_on_final, test_timeout=test_timeout, report_out=report,
+                )
+                outcome["done"] = (results, count)
+                try:
+                    _search_log_finish(row_id, _serialize_search_results(results), count)
+                except Exception as e:
+                    print(f"[SEARCH DB] could not log results for {row_id}: {e}")
+                if report:
+                    _save_search_test_report(row_id, query, report)
+            except SearchCancelled:
+                outcome["cancelled"] = True
+                _search_log_finish(row_id, status="cancelled")
+            except Exception as error:
+                outcome["error"] = error
+                _search_log_finish(row_id, status="failed", error=f"{type(error).__name__}: {error}")
+            finally:
+                search_lock.release()
+                ready.set()
+
+        threading.Thread(target=_runner, daemon=True).start()
+        ready.wait()
+        if "cancelled" in outcome:
+            raise SearchCancelled()
+        if "error" in outcome:
+            raise outcome["error"]
+        if "done" in outcome:
+            return outcome["done"]
+        return outcome["final"]
 
     row_id = _search_log_insert(chat_id, user_id, user, query, mode, queued=True)
     if row_id is None:
         # DB unavailable: fall back to waiting for a local slot.
         with search_lock:
-            return run_lncrawl_search(query)
+            return run_lncrawl_search(query, cancel_event=cancel_event)
 
     print(f"[SEARCH] {SERVER_ID} busy; queued search {row_id} for user={user_id} query={query!r}")
     deadline = time.time() + SEARCH_QUEUE_WAIT
     last_partial_seq = 0
     while time.time() < deadline:
         time.sleep(SEARCH_POLL_INTERVAL)
+        if cancel_event is not None and cancel_event.is_set():
+            _search_cancel(row_id)
+            raise SearchCancelled()
         row = _search_get(row_id, want_partial=True)
         if not row:
             continue
         if row["status"] == "done":
             return _deserialize_search_results(row["results"]), row["source_count"] or 0
+        if row["status"] == "cancelled":
+            raise SearchCancelled()
         if row["status"] in ("failed", "abandoned"):
             raise Exception(row["error"] or "Search failed")
         if progress_cb:
@@ -2619,12 +2962,20 @@ def run_search_request(chat_id, user_id, user, query, mode="search", progress_cb
                     "total": row["progress_total"],
                     "ahead": row["ahead"],
                 })
-                seq, items = _unpack_partial(row.get("partial_results"))
-                if items and seq > last_partial_seq:
-                    last_partial_seq = seq
-                    progress_cb({"phase": "running", "partial": _deserialize_search_results(items)})
             except Exception as e:
                 print(f"[SEARCH] progress callback failed: {e}")
+        try:
+            seq, items, is_final = _unpack_partial(row.get("partial_results"))
+            if items and seq > last_partial_seq:
+                last_partial_seq = seq
+                results = _deserialize_search_results(items)
+                if is_final:
+                    # Test mode on the worker: this is the user's final list, the worker keeps collecting late answers.
+                    return results, row["progress_total"] or 0
+                if progress_cb:
+                    progress_cb({"phase": "running", "partial": results})
+        except Exception as e:
+            print(f"[SEARCH] partial handling failed: {e}")
     _search_abandon(row_id)
     raise Exception("Search timed out waiting for a free server. Please try again.")
 
@@ -2668,12 +3019,17 @@ def _run_claimed_search(row):
     """Runs on a thread; the caller already holds one search_lock slot."""
     print(f"[SEARCH QUEUE] {SERVER_ID} running search {row['id']} query={row['query']!r}")
     last_write = [0.0]
+    cancel_event = threading.Event()
+    test_timeout = _search_test_timeout()
+    report = {} if test_timeout else None
 
     def _progress(done, total):
         now = time.time()
         if now - last_write[0] >= SEARCH_PROGRESS_DB_INTERVAL:
             last_write[0] = now
             _search_progress_update(row["id"], done, total)
+            if _search_is_cancelled(row["id"]):
+                cancel_event.set()      # the requester pressed Cancel
 
     partial_seq = [0]
 
@@ -2681,9 +3037,21 @@ def _run_claimed_search(row):
         partial_seq[0] += 1
         _search_partial_update(row["id"], {"seq": partial_seq[0], "results": _serialize_search_results(results)})
 
+    def _final(results, total):
+        partial_seq[0] += 1
+        _search_progress_update(row["id"], total, total)
+        _search_partial_update(row["id"], {"seq": partial_seq[0], "results": _serialize_search_results(results), "final": True})
+
     try:
-        results, count = run_lncrawl_search(row["query"], on_progress=_progress, on_partial=_partial)
+        results, count = run_lncrawl_search(
+            row["query"], on_progress=_progress, on_partial=_partial, cancel_event=cancel_event,
+            on_final=_final, test_timeout=test_timeout, report_out=report,
+        )
         _search_log_finish(row["id"], _serialize_search_results(results), count)
+        if report:
+            _save_search_test_report(row["id"], row["query"], report)
+    except SearchCancelled:
+        print(f"[SEARCH QUEUE] search {row['id']} cancelled")
     except Exception as error:
         print(f"[SEARCH QUEUE] search {row['id']} failed: {type(error).__name__}: {error}")
         _search_log_finish(row["id"], status="failed", error=f"{type(error).__name__}: {error}")
@@ -2729,7 +3097,7 @@ def reap_orphaned_searches():
                               OR s.status = 'offline'
                               OR s.run_id IS DISTINCT FROM p.run_id
                               OR s.last_heartbeat < NOW() - INTERVAL '60 seconds'
-                              OR p.started_at < NOW() - INTERVAL '10 minutes'
+                              OR p.started_at < NOW() - INTERVAL '15 minutes'
                           )
                     """)
                     for o in cur.fetchall():
@@ -3311,6 +3679,39 @@ if SERVER_ID == "s4":
         return None, "Use a numeric user ID or @username."
 
 
+    def _dispatch_command(message):
+        """Run a command that was typed while the bot was waiting for a text reply."""
+        try:
+            bot.process_new_messages([message])
+        except Exception as error:
+            print(f"[COMMAND DISPATCH] {error}")
+
+    def _admin_args_reply(message, command):
+        user_responded(message.from_user.id)
+        _complete_timed_reply(message.chat.id, message.from_user.id)
+        text = (message.text or "").strip()
+        if not text:
+            send_temp_message(message.chat.id, f"Please reply with text. Send {command} again to retry.", message.from_user.id)
+            return
+        if text.startswith("/"):
+            _dispatch_command(message)
+            return
+        import copy
+        forwarded = copy.copy(message)
+        forwarded.text = f"{command} {text}"      # same as if they had typed "/addsite site.com" in one go
+        _dispatch_command(forwarded)
+
+    def _ask_admin_args(message, prompt):
+        """An admin command sent with no details: ask for them and wait (REPLY_PROMPT_TIMEOUT_SECONDS) for the reply."""
+        parts = (message.text or "").split()
+        if len(parts) > 1 or message.from_user.id not in ADMIN_USER_ID:
+            return False
+        send_prompt(message.chat.id, prompt, message.from_user.id)
+        register_timed_next_step(
+            message.chat.id, message.from_user.id, _admin_args_reply, "admin", parts[0].split("@")[0].lower(),
+        )
+        return True
+
     @bot.message_handler(commands=["banuser", "unbanuser", "userlimit"])
     def manage_user_control(message):
         if message.from_user.id not in ADMIN_USER_ID:
@@ -3318,6 +3719,13 @@ if SERVER_ID == "s4":
             return
 
         parts = message.text.split()
+
+        if _ask_admin_args(message, {
+            "/banuser": "Which user do you want to ban? Send the user ID or @username.",
+            "/unbanuser": "Which user do you want to unban? Send the user ID or @username.",
+            "/userlimit": "Send the user ID or @username, then the daily limit (a number, or off). Example: 123456789 5",
+        }.get(parts[0].split("@")[0].lower(), "Send the user ID or @username.")):
+            return
 
         if len(parts) < 2:
             safe_send_message(
@@ -3443,6 +3851,8 @@ if SERVER_ID == "s4":
     def ignoreimages(message):
         if not _require_site_admin(message):
             return
+        if _ask_admin_args(message, "Which website should skip chapter images? Send the domain, for example dreamy-translations.com"):
+            return
         domain, _ = _site_command_parts(message, "/ignoreimages domain")
         if not domain:
             return
@@ -3468,6 +3878,8 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['unignoreimages'])
     def unignoreimages(message):
         if not _require_site_admin(message):
+            return
+        if _ask_admin_args(message, "Which website should get its chapter images back? Send the domain."):
             return
         domain, _ = _site_command_parts(message, "/unignoreimages domain")
         if not domain:
@@ -3559,6 +3971,8 @@ if SERVER_ID == "s4":
     def bansite(message):
         if not _require_site_admin(message):
             return
+        if _ask_admin_args(message, "Which website do you want to block, and why? Send the domain followed by the reason, for example: site.com copyright complaint"):
+            return
         domain, reason = _site_command_parts(message, "/bansite domain reason", require_value=True)
         if not domain:
             return
@@ -3585,6 +3999,8 @@ if SERVER_ID == "s4":
     def unbansite(message):
         if not _require_site_admin(message):
             return
+        if _ask_admin_args(message, "Which website do you want to unblock? Send the domain."):
+            return
         domain, _ = _site_command_parts(message, "/unbansite domain")
         if not domain:
             return
@@ -3607,6 +4023,8 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['addsource', 'addsite'])
     def addsource(message):
         if not _require_site_admin(message):
+            return
+        if _ask_admin_args(message, "Which novel website do you want to add to the /sources list? Send the domain, optionally followed by a note, for example: dreamy-translations.com fast updates"):
             return
         domain, note = _site_command_parts(message, "/addsource domain [note]")
         if not domain:
@@ -3635,6 +4053,8 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['removesource', 'deletesource', 'delsource', 'removesite', 'deletesite', 'delsite'])
     def delsource(message):
         if not _require_site_admin(message):
+            return
+        if _ask_admin_args(message, "Which website do you want to remove from the /sources list? Send the domain."):
             return
         domain, _ = _site_command_parts(message, "/delsource domain")
         if not domain:
@@ -4398,6 +4818,7 @@ if SERVER_ID == "s4":
     SEARCH_SESSION_SECONDS = 600
     search_sessions = {}
     active_search_sessions = {}
+    search_jobs = {}          # token -> {"cancel": Event, "message_id": id of the 'Searching...' message}
     search_session_lock = threading.Lock()
 
 
@@ -4409,6 +4830,10 @@ if SERVER_ID == "s4":
             session = search_sessions.pop(token, None)
             if session and active_search_sessions.get(_search_key(session["chat_id"], session["user_id"])) == token:
                 active_search_sessions.pop(_search_key(session["chat_id"], session["user_id"]), None)
+        if session and session.get("searching"):
+            job = search_jobs.get(token)
+            if job:
+                job["cancel"].set()      # closing the list also stops the search that is still running behind it
         if delete_message and session and session.get("message_id"):
             try:
                 bot.delete_message(session["chat_id"], session["message_id"])
@@ -4460,6 +4885,10 @@ if SERVER_ID == "s4":
                 )
             else:
                 markup.row(counter)
+            if session.get("from_cache") and not session.get("searching"):
+                markup.row(telebot.types.InlineKeyboardButton(
+                    "🔄 Refresh search results", callback_data=_search_callback_data(token, "refresh"),
+                ))
         elif view == "sources":
             result = session["results"][index]
             for source_index, novel in enumerate(result.novels):
@@ -4530,6 +4959,8 @@ if SERVER_ID == "s4":
             text += "\n\n" + SEARCH_STILL_TEXT
             if total:
                 text += f" Searched {done}/{total} sources"
+        elif session.get("from_cache"):
+            text += "\n\n" + SEARCH_CACHED_TEXT.format(age=_format_age(session.get("cache_age")))
         _search_edit(session, text, _search_markup(session, "list"))
 
     def _render_search_sources(session, result_index):
@@ -4555,21 +4986,28 @@ if SERVER_ID == "s4":
         )
         _search_edit(session, text, _search_markup(session, "confirm", result_index))
 
-    def _start_search(chat_id, user_id, query, mode="search", user=None):
+    def _start_search(chat_id, user_id, query, mode="search", user=None, fresh=False):
         key = _search_key(chat_id, user_id)
         token = uuid.uuid4().hex[:12]
         old_session = None
+        old_job = None
         with search_session_lock:
             old_token = active_search_sessions.get(key)
             if old_token:
                 old_session = search_sessions.pop(old_token, None)
+                old_job = search_jobs.get(old_token)
             active_search_sessions[key] = token
-        if old_session and old_session.get("message_id"):
-            try:
-                bot.delete_message(old_session["chat_id"], old_session["message_id"])
-            except Exception:
-                pass
-        threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token, user), daemon=True).start()
+            search_jobs[token] = {"cancel": threading.Event(), "message_id": None}
+        if old_job:
+            old_job["cancel"].set()      # a new search replaces the old one, so stop the old one too
+        old_message_ids = {(old_session or {}).get("message_id"), (old_job or {}).get("message_id")}
+        for message_id in old_message_ids:
+            if message_id:
+                try:
+                    bot.delete_message(chat_id, message_id)
+                except Exception:
+                    pass
+        threading.Thread(target=_search_worker, args=(chat_id, user_id, query, mode, token, user, fresh), daemon=True).start()
 
     def _search_progress_text(query, info):
         head = f"Searching for {query}...\n{SEARCH_ETA_TEXT}"
@@ -4580,9 +5018,25 @@ if SERVER_ID == "s4":
             return head
         return f"{head}\n\nSearched {done}/{total} sources"
 
-    def _search_worker(chat_id, user_id, query, mode, token, user=None):
-        searching_msg = safe_send_message(chat_id, f"Searching for {query}...\n{SEARCH_ETA_TEXT}")
-        state = {"last_edit": time.time(), "last_text": None, "session": None, "progress": (0, 0)}
+    def _search_worker(chat_id, user_id, query, mode, token, user=None, fresh=False):
+        job = search_jobs.get(token) or {"cancel": threading.Event(), "message_id": None}
+        try:
+            _run_search_job(chat_id, user_id, query, mode, token, user, fresh, job)
+        finally:
+            search_jobs.pop(token, None)
+
+    def _run_search_job(chat_id, user_id, query, mode, token, user, fresh, job):
+        cancel_event = job["cancel"]
+        stop_markup = telebot.types.InlineKeyboardMarkup()
+        stop_markup.row(telebot.types.InlineKeyboardButton("Cancel", callback_data=f"searchstop:{token}"))
+        try:
+            searching_msg = bot.send_message(chat_id, f"Searching for {query}...\n{SEARCH_ETA_TEXT}", reply_markup=stop_markup)
+        except Exception as error:
+            print(f"[SEARCH MESSAGE ERROR] {error}")
+            searching_msg = None
+        if searching_msg:
+            job["message_id"] = searching_msg.message_id
+        state = {"last_edit": time.time(), "last_text": None, "session": None, "progress": (0, 0), "finished": False}
 
         def _drop_searching_msg():
             if searching_msg:
@@ -4592,9 +5046,9 @@ if SERVER_ID == "s4":
                     pass
 
         def _show_partial(partial):
-            """Interim list (at 60s, 90s). The first one turns the 'Searching...' message into the list;
+            """Interim list (at 50s, 70s). The first one turns the 'Searching...' message into the list;
             later ones are folded in so page 1 never reshuffles under the user."""
-            if not partial or not searching_msg:
+            if not partial or not searching_msg or state["finished"] or cancel_event.is_set():
                 return
             session = state["session"]
             if session is None:
@@ -4640,6 +5094,8 @@ if SERVER_ID == "s4":
                 _render_search_list(session)
 
         def progress_cb(info):
+            if state["finished"] or cancel_event.is_set():
+                return
             if "partial" in info:
                 _show_partial(info["partial"])
                 return
@@ -4665,19 +5121,30 @@ if SERVER_ID == "s4":
             state["last_edit"] = now
             state["last_text"] = text
             try:
-                bot.edit_message_text(text, chat_id, searching_msg.message_id)
+                bot.edit_message_text(text, chat_id, searching_msg.message_id, reply_markup=stop_markup)
             except Exception:
                 pass
 
+        info = {}
         try:
-            results, source_count = run_search_request(chat_id, user_id, user, query, mode, progress_cb=progress_cb)
+            results, source_count = run_search_request(
+                chat_id, user_id, user, query, mode, progress_cb=progress_cb,
+                cancel_event=cancel_event, fresh=fresh, info=info,
+            )
+        except SearchCancelled:
+            state["finished"] = True
+            return                      # whoever cancelled has already cleaned up the messages
         except Exception as error:
+            state["finished"] = True
             if state["session"] is not None:
                 _finish_partial(None)      # keep the interim list, just stop the 'still searching' note
                 return
             _drop_searching_msg()
             print(f"[SEARCH ERROR] user={user_id} query={query!r}: {type(error).__name__}: {error}")
             send_temp_message(chat_id, f"Search failed: {type(error).__name__}: {error}", user_id)
+            return
+        state["finished"] = True
+        if cancel_event.is_set():
             return
         # Cached and queued results may come from an older ordering, so always rank here too.
         results = _rank_search_results(results, query)
@@ -4707,6 +5174,8 @@ if SERVER_ID == "s4":
             # The "Searching..." message turns into the result list in place.
             "message_id": searching_msg.message_id if searching_msg else None,
             "view": "list",
+            "from_cache": bool(info.get("cached")),
+            "cache_age": info.get("cached_age"),
         }
         with search_session_lock:
             search_sessions[token] = session
@@ -4720,7 +5189,7 @@ if SERVER_ID == "s4":
         _complete_timed_reply(chat_id, user_id)
         query = (message.text or "").strip()
         if message.text and query.startswith("/"):
-            send_temp_message(chat_id, "Search cancelled. Send /search again with a novel name.", user_id)
+            _dispatch_command(message)      # they typed another command: do that instead of searching for it
             return
         if len(query) < 2:
             send_temp_message(chat_id, "The name must be at least 2 characters. Send /search to try again.", user_id)
@@ -4730,8 +5199,45 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['search'])
     def search_novels(message):
         user_id = message.from_user.id
+        parts = (message.text or "").split(maxsplit=1)
+        name = parts[1].strip() if len(parts) > 1 else ""
+        if name:
+            # /search mad god  -> search straight away
+            _clear_timed_reply(message.chat.id)
+            user_responded(user_id)
+            if len(name) < 2:
+                send_temp_message(message.chat.id, "The name must be at least 2 characters.", user_id)
+                return
+            _start_search(message.chat.id, user_id, name, user=message.from_user)
+            return
         send_prompt(message.chat.id, "Enter the novel name to search for:", user_id)
         register_timed_next_step(message.chat.id, user_id, get_search_query, "search")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("searchstop:"))
+    def handle_search_stop(call):
+        token = call.data.split(":", 1)[1]
+        key = _search_key(call.message.chat.id, call.from_user.id)
+        with search_session_lock:
+            owns = active_search_sessions.get(key) == token
+            job = search_jobs.get(token)
+        if not owns:
+            bot.answer_callback_query(call.id, "This search has already ended.")
+            try:
+                bot.delete_message(call.message.chat.id, call.message.message_id)
+            except Exception:
+                pass
+            return
+        if job:
+            job["cancel"].set()
+        _close_search_session(token)
+        with search_session_lock:
+            if active_search_sessions.get(key) == token:
+                active_search_sessions.pop(key, None)
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Search cancelled.")
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("search:"))
     def handle_search_selection(call):
@@ -4749,6 +5255,12 @@ if SERVER_ID == "s4":
         if action == "cancel":
             _close_search_session(token, delete_message=True)
             bot.answer_callback_query(call.id, "Search cancelled.")
+            return
+        if action == "refresh":
+            query, mode = session["query"], session["mode"]
+            _close_search_session(token, delete_message=True)
+            bot.answer_callback_query(call.id, "Starting a fresh search...")
+            _start_search(call.message.chat.id, call.from_user.id, query, mode, call.from_user, fresh=True)
             return
         if action == "page":
             session["page"] = max(0, min(int(value), (len(session["results"]) - 1) // RESULTS_PER_PAGE))
@@ -4785,6 +5297,14 @@ if SERVER_ID == "s4":
     @bot.message_handler(commands=['download'])
     def download(message):
         user_id = message.from_user.id
+        parts = (message.text or "").split(maxsplit=1)
+        value = parts[1].strip() if len(parts) > 1 else ""
+        if value:
+            # /download <url>  -> straight to the scan;  /download <title>  -> search
+            _clear_timed_reply(message.chat.id)
+            user_responded(user_id)
+            _handle_download_input(message, value, "v4")
+            return
         send_prompt(message.chat.id, "Enter a novel URL or title:", user_id)
         register_timed_next_step(message.chat.id, user_id, get_url, "url", "v4")
 
@@ -5053,12 +5573,9 @@ if SERVER_ID == "s4":
 
 
 
-    def get_url(message, version):
-        user_responded(message.from_user.id)
-        value = (message.text or "").strip()
+    def _handle_download_input(message, value, version):
         user_id = message.from_user.id
         chat_id = message.chat.id
-        _complete_timed_reply(chat_id, user_id)
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             if len(value) < 2:
@@ -5067,6 +5584,17 @@ if SERVER_ID == "s4":
             _start_search(chat_id, user_id, value, mode="download", user=message.from_user)
             return
         _start_url_scan(message, value, version, message.from_user)
+
+    def get_url(message, version):
+        user_responded(message.from_user.id)
+        value = (message.text or "").strip()
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        _complete_timed_reply(chat_id, user_id)
+        if value.startswith("/"):
+            _dispatch_command(message)      # they typed another command: do that instead of searching for it
+            return
+        _handle_download_input(message, value, version)
 
     def _start_url_scan(message, url, version, requester):
         user_id = requester.id
@@ -5493,6 +6021,105 @@ if SERVER_ID == "s4":
             send_temp_message(message.chat.id, f"⚠️ Could not load search logs: {e}", message.from_user.id)
         finally:
             conn.close()
+
+    def _parse_test_duration(text):
+        """'2 minutes', '90s', '5m' -> seconds. A bare number means minutes."""
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes)?", text.strip().lower())
+        if not m:
+            return None
+        value = float(m.group(1))
+        unit = m.group(2) or "m"
+        return int(value if unit.startswith("s") else value * 60)
+
+    def _send_in_chunks(chat_id, text):
+        chunk = ""
+        for line in text.split("\n"):
+            if chunk and len(chunk) + len(line) + 1 > 3900:
+                safe_send_message(chat_id, chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            safe_send_message(chat_id, chunk)
+
+    def _test_status_text():
+        seconds = _search_test_timeout()
+        if not seconds:
+            return "🧪 Test searches are OFF."
+        try:
+            left = float(str(_api_setting_get("search_test", "")).split("|")[1]) - time.time()
+        except Exception:
+            left = 0
+        return (
+            f"🧪 Test searches are ON: every search keeps running for up to {seconds}s, while users still get their "
+            f"lists on the normal schedule (final list at {SEARCH_TIMEOUT}s). Switches itself off in {_format_age(left)}."
+        )
+
+    @bot.message_handler(commands=['testsearches'])
+    def testsearches(message):
+        # Admin only. /testsearches [on | off | <time> | report [number]]
+        if message.from_user.id not in ADMIN_USER_ID:
+            safe_send_message(message.chat.id, "❌ Access Denied.")
+            return
+        chat_id = message.chat.id
+        parts = (message.text or "").split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        if arg in ("off", "stop", "disable"):
+            _search_test_set(None)
+            safe_send_message(chat_id, "🧪 Test searches are OFF. Searches stop at the normal timeout again.")
+            return
+
+        if arg.startswith("report"):
+            rest = arg[len("report"):].strip()
+            rows = _load_search_test_reports(report_id=int(rest)) if rest.isdigit() else _load_search_test_reports(limit=1)
+            if not rows:
+                safe_send_message(chat_id, "No test report found. Turn test mode on with /testsearches on and run a search first.")
+                return
+            row = rows[0]
+            _send_in_chunks(chat_id, _format_test_report(row["id"], row["search_id"], row["data"]))
+            return
+
+        if arg in ("on", "enable") or (arg and _parse_test_duration(arg)):
+            seconds = SEARCH_TEST_DEFAULT_SECONDS if arg in ("on", "enable") else _parse_test_duration(arg)
+            if not (SEARCH_TIMEOUT < seconds <= SEARCH_TEST_MAX_SECONDS):
+                safe_send_message(
+                    chat_id,
+                    f"Choose a time longer than {SEARCH_TIMEOUT} seconds and at most {SEARCH_TEST_MAX_SECONDS // 60} minutes, "
+                    "for example /testsearches 2 minutes",
+                )
+                return
+            if not _search_test_set(seconds):
+                safe_send_message(chat_id, "❌ Database error. Test mode was not changed.")
+                return
+            safe_send_message(
+                chat_id,
+                f"{_test_status_text()}\n\nEach search holds its slot for the full time, so use this for short tests and "
+                "lower the time once you know the slowest answer. Read the results with /testsearches report.",
+            )
+            return
+
+        if arg:
+            safe_send_message(chat_id, "Usage: /testsearches on | off | <time, e.g. 2 minutes> | report [number]")
+            return
+
+        lines = [_test_status_text(), ""]
+        rows = _load_search_test_reports(limit=10)
+        if rows:
+            lines.append("Latest test searches, newest first (open one with /testsearches report <number>):")
+            for row in rows:
+                ok, late, slowest, deadline = _report_stats(row["data"])
+                slow_text = f"{slowest['end']}s" if slowest else "none"
+                lines.append(f"#{row['id']}  {row['query']}  -  {len(late)} answer(s) after {deadline:.0f}s, slowest {slow_text}")
+        else:
+            lines.append("No test reports yet. Turn test mode on with /testsearches on, then run a search.")
+        lines += [
+            "",
+            f"/testsearches on - searches run up to {SEARCH_TEST_DEFAULT_SECONDS // 60} minutes",
+            f"/testsearches 2 minutes - choose the length (up to {SEARCH_TEST_MAX_SECONDS // 60} minutes)",
+            "/testsearches off",
+            "/testsearches report [number] - full report, default is the latest",
+        ]
+        _send_in_chunks(chat_id, "\n".join(lines))
 
     @bot.message_handler(commands=['deadsources'])
     def deadsources(message):
