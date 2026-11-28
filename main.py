@@ -991,8 +991,10 @@ def _reply_prompt_timeout(chat_id, token, delay):
         user_id,
     )
 
-def register_timed_next_step(chat_id, user_id, handler, kind, *args, timeout=REPLY_PROMPT_TIMEOUT_SECONDS):
+def register_timed_next_step(chat_id, user_id, handler, kind, *args, timeout=None):
     """Replace any older text reply prompt in this chat and expire this one safely."""
+    if timeout is None:
+        timeout = REPLY_PROMPT_TIMEOUT_SECONDS
     _clear_timed_reply(chat_id)
     token = uuid.uuid4().hex
     pending_reply_states[chat_id] = {
@@ -1761,7 +1763,9 @@ def request_preview(url, version, user_id, chat_id, username=None, first_name=No
     finally:
         conn.close()
 
-def start_range_timeout(user, chat_id, url, version, title, total_chapters, delay=600):
+def start_range_timeout(user, chat_id, url, version, title, total_chapters, delay=None):
+    if delay is None:
+        delay = REPLY_PROMPT_TIMEOUT_SECONDS
     version = force_v4(version)
     _clear_timed_reply(chat_id, user.id)
     token = str(uuid.uuid4())
@@ -2101,6 +2105,350 @@ SOURCE_RETRY_DAYS = 3          # a dropped site is tried again after this many d
 _dropped_cache = {"at": 0.0, "urls": set()}
 SEARCH_HISTORY_DAYS = 7
 search_lock = threading.Semaphore(SEARCH_SLOTS)
+
+
+# ---------------------- LIVE /set SETTINGS ----------------------
+# Hard-coded values above are the defaults. /set stores an override in
+# bot_settings (key "set:<NAME>"). Every worker re-reads those rows every
+# RUNTIME_REFRESH_SECONDS and copies them onto these globals, so a change
+# survives restarts and reaches servers that were not the one that ran /set.
+# /reset deletes the override and the next refresh restores the default.
+RUNTIME_REFRESH_SECONDS = 30
+RUNTIME_PREFIX = "set:"
+
+# Captured once, before any override is applied.
+RUNTIME_DEFAULTS = {
+    "SEARCH_TIMEOUT": int(SEARCH_TIMEOUT),
+    "SEARCH_CACHE_SECONDS": int(SEARCH_CACHE_SECONDS),
+    "SEARCH_PARTIAL_TIMES": f"{int(SEARCH_PARTIAL_TIMES[0])},{int(SEARCH_PARTIAL_TIMES[1])}",
+    "SEARCH_SLOTS": int(SEARCH_SLOTS),
+    "SEARCH_CONCURRENCY": int(SEARCH_CONCURRENCY),
+    "HARD_TASK_LIMIT_HOURS": int(HARD_TASK_LIMIT_HOURS),
+    "STUCK_PROGRESS_MINUTES": int(STUCK_PROGRESS_MINUTES),
+    "UPLOAD_RETRY_DELAY_MINUTES": int(UPLOAD_RETRY_DELAY_MINUTES),
+    "UPLOAD_RETRY_KEEP_HOURS": int(UPLOAD_RETRY_KEEP_HOURS),
+    "UPLOAD_RETRY_SECOND_DELAY_MINUTES": int(UPLOAD_RETRY_SECOND_DELAY_MINUTES),
+    "PROGRESS_UPDATE_INTERVAL": int(PROGRESS_UPDATE_INTERVAL),
+    "MAX_LIVE_PROGRESS_PER_USER": int(MAX_LIVE_PROGRESS_PER_USER),
+    "USER_RETRY_WINDOW_HOURS": int(USER_RETRY_WINDOW_HOURS),
+    "USER_RETRY_SLOT_LIMIT": int(USER_RETRY_SLOT_LIMIT),
+    "RESULTS_PER_PAGE": int(RESULTS_PER_PAGE),
+    "SOURCE_DROP_AFTER": int(SOURCE_DROP_AFTER),
+    "SOURCE_RETRY_DAYS": int(SOURCE_RETRY_DAYS),
+    "REPLY_PROMPT_TIMEOUT_SECONDS": int(REPLY_PROMPT_TIMEOUT_SECONDS),
+    "LOCAL_API_FALLBACK_AFTER_MINUTES": int(LOCAL_API_FALLBACK_AFTER_MINUTES),
+    "LOCAL_API_MAX_SILENCE_MINUTES": int(LOCAL_API_MAX_SILENCE_MINUTES),
+    "TELEGRAM_CLOUD_LOCKOUT_MINUTES": int(TELEGRAM_CLOUD_LOCKOUT_MINUTES),
+    "CONNECT_TIMEOUT": int(apihelper.CONNECT_TIMEOUT),
+    "READ_TIMEOUT": int(apihelper.READ_TIMEOUT),
+    "ADMIN_USER_ID": ",".join(str(int(x)) for x in ADMIN_USER_ID),
+    "SPLIT_PDF": int(SPLIT_DEFAULTS.get("pdf", 0)),
+}
+
+# type: int | admins | pair. min/max apply to each integer.
+RUNTIME_SPECS = {
+    "SEARCH_TIMEOUT": {"type": "int", "min": 15, "max": 600},
+    "SEARCH_CACHE_SECONDS": {"type": "int", "min": 0, "max": 7 * 24 * 3600},
+    "SEARCH_PARTIAL_TIMES": {"type": "pair", "min": 1, "max": 600},
+    "SEARCH_SLOTS": {"type": "int", "min": 1, "max": 8},
+    "SEARCH_CONCURRENCY": {"type": "int", "min": 1, "max": 40},
+    "HARD_TASK_LIMIT_HOURS": {"type": "int", "min": 1, "max": 48},
+    "STUCK_PROGRESS_MINUTES": {"type": "int", "min": 2, "max": 180},
+    "UPLOAD_RETRY_DELAY_MINUTES": {"type": "int", "min": 1, "max": 180},
+    "UPLOAD_RETRY_KEEP_HOURS": {"type": "int", "min": 1, "max": 72},
+    "UPLOAD_RETRY_SECOND_DELAY_MINUTES": {"type": "int", "min": 1, "max": 180},
+    "PROGRESS_UPDATE_INTERVAL": {"type": "int", "min": 3, "max": 120},
+    "MAX_LIVE_PROGRESS_PER_USER": {"type": "int", "min": 1, "max": 10},
+    "USER_RETRY_WINDOW_HOURS": {"type": "int", "min": 1, "max": 72},
+    "USER_RETRY_SLOT_LIMIT": {"type": "int", "min": 1, "max": 20},
+    "RESULTS_PER_PAGE": {"type": "int", "min": 3, "max": 30},
+    "SOURCE_DROP_AFTER": {"type": "int", "min": 1, "max": 30},
+    "SOURCE_RETRY_DAYS": {"type": "int", "min": 1, "max": 30},
+    "REPLY_PROMPT_TIMEOUT_SECONDS": {"type": "int", "min": 60, "max": 3600},
+    "LOCAL_API_FALLBACK_AFTER_MINUTES": {"type": "int", "min": 1, "max": 180},
+    "LOCAL_API_MAX_SILENCE_MINUTES": {"type": "int", "min": 1, "max": 180},
+    "TELEGRAM_CLOUD_LOCKOUT_MINUTES": {"type": "int", "min": 1, "max": 120},
+    "CONNECT_TIMEOUT": {"type": "int", "min": 5, "max": 300},
+    "READ_TIMEOUT": {"type": "int", "min": 30, "max": 3600},
+    "ADMIN_USER_ID": {"type": "admins", "min": 1, "max": 30},
+    "SPLIT_PDF": {"type": "int", "min": 0, "max": 5000},
+}
+
+RUNTIME_ALIASES = {
+    "ADMINS": "ADMIN_USER_ID",
+    "APIHELPER.CONNECT_TIMEOUT": "CONNECT_TIMEOUT",
+    "APIHELPER.READ_TIMEOUT": "READ_TIMEOUT",
+}
+
+pending_runtime_confirm = {}  # user_id -> {token, action, key, stored}
+
+
+def _canon_runtime_key(raw):
+    key = (raw or "").strip().upper().replace(" ", "")
+    return RUNTIME_ALIASES.get(key, key)
+
+
+def _clamp_int(name, number):
+    spec = RUNTIME_SPECS[name]
+    return max(spec["min"], min(spec["max"], int(number)))
+
+
+def _parse_runtime_value(name, raw):
+    """Return (stored_text, error). stored_text is what goes into bot_settings."""
+    spec = RUNTIME_SPECS.get(name)
+    if not spec:
+        known = ", ".join(sorted(RUNTIME_SPECS))
+        return None, f"Unknown setting {name}. Send /set with no arguments to list them.\nKnown: {known}"
+    text = (raw or "").strip()
+    if spec["type"] == "int":
+        try:
+            number = int(float(text))
+        except ValueError:
+            return None, f"{name} must be a whole number between {spec['min']} and {spec['max']}."
+        if number < spec["min"] or number > spec["max"]:
+            return None, f"{name} must be between {spec['min']} and {spec['max']}."
+        return str(number), None
+    if spec["type"] == "pair":
+        parts = [p for p in re.split(r"[,\s]+", text) if p]
+        if len(parts) != 2:
+            return None, f"{name} needs two numbers, for example 50,70."
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None, f"{name} needs two whole numbers."
+        if not (spec["min"] <= a <= spec["max"] and spec["min"] <= b <= spec["max"]):
+            return None, f"Each number in {name} must be between {spec['min']} and {spec['max']}."
+        if a >= b:
+            return None, "The first partial time must be smaller than the second."
+        return f"{a},{b}", None
+    if spec["type"] == "admins":
+        ids = []
+        for part in re.split(r"[,\s]+", text):
+            if not part:
+                continue
+            if not part.isdigit():
+                return None, "Admin IDs must be numbers separated by commas. Example: 111,222,333"
+            number = int(part)
+            if number not in ids:
+                ids.append(number)
+        if not (spec["min"] <= len(ids) <= spec["max"]):
+            return None, f"Provide between {spec['min']} and {spec['max']} admin IDs."
+        return ",".join(str(i) for i in ids), None
+    return None, "Unsupported setting type."
+
+
+def _load_runtime_overrides():
+    """{NAME: stored_text} for rows this process should apply. None if the DB is down."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT setting_key, setting_value FROM bot_settings WHERE setting_key LIKE %s",
+                (RUNTIME_PREFIX + "%",),
+            )
+            rows = {}
+            for row in cur.fetchall():
+                key = row["setting_key"][len(RUNTIME_PREFIX):]
+                if key in RUNTIME_SPECS and row["setting_value"] is not None:
+                    rows[key] = str(row["setting_value"])
+            return rows
+    except Exception as error:
+        print(f"[RUNTIME SETTINGS] read: {error}")
+        return None
+    finally:
+        conn.close()
+
+
+def _format_runtime_current(name):
+    if name == "ADMIN_USER_ID":
+        return ",".join(str(int(x)) for x in ADMIN_USER_ID)
+    if name == "SEARCH_PARTIAL_TIMES":
+        return f"{int(SEARCH_PARTIAL_TIMES[0])},{int(SEARCH_PARTIAL_TIMES[1])}"
+    if name == "CONNECT_TIMEOUT":
+        return str(int(apihelper.CONNECT_TIMEOUT))
+    if name == "READ_TIMEOUT":
+        return str(int(apihelper.READ_TIMEOUT))
+    if name == "SPLIT_PDF":
+        raw = str(_api_setting_get("split_size_pdf", "") or "").strip()
+        if raw:
+            try:
+                return str(max(0, int(raw)))
+            except ValueError:
+                pass
+        return str(int(RUNTIME_DEFAULTS["SPLIT_PDF"]))
+    return str(int(globals()[name]))
+
+
+def apply_runtime_settings():
+    """Copy bot_settings overrides onto the live globals. Missing rows restore defaults."""
+    global SEARCH_TIMEOUT, SEARCH_CACHE_SECONDS, SEARCH_PARTIAL_TIMES
+    global SEARCH_SLOTS, SEARCH_CONCURRENCY, search_lock
+    global HARD_TASK_LIMIT_HOURS, STUCK_PROGRESS_MINUTES
+    global UPLOAD_RETRY_DELAY_MINUTES, UPLOAD_RETRY_KEEP_HOURS, UPLOAD_RETRY_SECOND_DELAY_MINUTES
+    global PROGRESS_UPDATE_INTERVAL, MAX_LIVE_PROGRESS_PER_USER
+    global USER_RETRY_WINDOW_HOURS, USER_RETRY_SLOT_LIMIT, RESULTS_PER_PAGE
+    global SOURCE_DROP_AFTER, SOURCE_RETRY_DAYS, REPLY_PROMPT_TIMEOUT_SECONDS
+    global LOCAL_API_FALLBACK_AFTER_MINUTES, LOCAL_API_MAX_SILENCE_MINUTES
+    global TELEGRAM_CLOUD_LOCKOUT_MINUTES, ADMIN_USER_ID
+    global SEARCH_QUEUE_WAIT, SEARCH_ETA_TEXT, SEARCH_STILL_TEXT
+
+    rows = _load_runtime_overrides()
+    if rows is None:
+        return False
+
+    def _int_setting(name):
+        raw = rows.get(name)
+        if raw is None:
+            return int(RUNTIME_DEFAULTS[name])
+        try:
+            return _clamp_int(name, int(float(raw)))
+        except ValueError:
+            return int(RUNTIME_DEFAULTS[name])
+
+    SEARCH_TIMEOUT = _int_setting("SEARCH_TIMEOUT")
+    SEARCH_CACHE_SECONDS = _int_setting("SEARCH_CACHE_SECONDS")
+    SEARCH_CONCURRENCY = _int_setting("SEARCH_CONCURRENCY")
+    HARD_TASK_LIMIT_HOURS = _int_setting("HARD_TASK_LIMIT_HOURS")
+    STUCK_PROGRESS_MINUTES = _int_setting("STUCK_PROGRESS_MINUTES")
+    UPLOAD_RETRY_DELAY_MINUTES = _int_setting("UPLOAD_RETRY_DELAY_MINUTES")
+    UPLOAD_RETRY_KEEP_HOURS = _int_setting("UPLOAD_RETRY_KEEP_HOURS")
+    UPLOAD_RETRY_SECOND_DELAY_MINUTES = _int_setting("UPLOAD_RETRY_SECOND_DELAY_MINUTES")
+    PROGRESS_UPDATE_INTERVAL = _int_setting("PROGRESS_UPDATE_INTERVAL")
+    MAX_LIVE_PROGRESS_PER_USER = _int_setting("MAX_LIVE_PROGRESS_PER_USER")
+    USER_RETRY_WINDOW_HOURS = _int_setting("USER_RETRY_WINDOW_HOURS")
+    USER_RETRY_SLOT_LIMIT = _int_setting("USER_RETRY_SLOT_LIMIT")
+    RESULTS_PER_PAGE = _int_setting("RESULTS_PER_PAGE")
+    SOURCE_DROP_AFTER = _int_setting("SOURCE_DROP_AFTER")
+    SOURCE_RETRY_DAYS = _int_setting("SOURCE_RETRY_DAYS")
+    REPLY_PROMPT_TIMEOUT_SECONDS = _int_setting("REPLY_PROMPT_TIMEOUT_SECONDS")
+    LOCAL_API_FALLBACK_AFTER_MINUTES = _int_setting("LOCAL_API_FALLBACK_AFTER_MINUTES")
+    LOCAL_API_MAX_SILENCE_MINUTES = _int_setting("LOCAL_API_MAX_SILENCE_MINUTES")
+    TELEGRAM_CLOUD_LOCKOUT_MINUTES = _int_setting("TELEGRAM_CLOUD_LOCKOUT_MINUTES")
+
+    partial_raw = rows.get("SEARCH_PARTIAL_TIMES", RUNTIME_DEFAULTS["SEARCH_PARTIAL_TIMES"])
+    try:
+        left, right = [int(float(x)) for x in str(partial_raw).split(",")[:2]]
+        spec = RUNTIME_SPECS["SEARCH_PARTIAL_TIMES"]
+        left = max(spec["min"], min(spec["max"], left))
+        right = max(spec["min"], min(spec["max"], right))
+        if left >= right:
+            raise ValueError
+        SEARCH_PARTIAL_TIMES = (left, right)
+    except (ValueError, TypeError):
+        a, b = RUNTIME_DEFAULTS["SEARCH_PARTIAL_TIMES"].split(",")
+        SEARCH_PARTIAL_TIMES = (int(a), int(b))
+
+    admin_raw = rows.get("ADMIN_USER_ID", RUNTIME_DEFAULTS["ADMIN_USER_ID"])
+    admin_ids = []
+    for part in str(admin_raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            number = int(part)
+            if number not in admin_ids:
+                admin_ids.append(number)
+    if admin_ids:
+        ADMIN_USER_ID = admin_ids
+    else:
+        ADMIN_USER_ID = [int(x) for x in RUNTIME_DEFAULTS["ADMIN_USER_ID"].split(",") if x]
+
+    apihelper.CONNECT_TIMEOUT = _int_setting("CONNECT_TIMEOUT")
+    apihelper.READ_TIMEOUT = _int_setting("READ_TIMEOUT")
+
+    slots = _int_setting("SEARCH_SLOTS")
+    if slots != SEARCH_SLOTS:
+        # New acquires use the new size. A search already holding the old
+        # semaphore finishes on it, so the cap can be briefly soft.
+        SEARCH_SLOTS = slots
+        search_lock = threading.Semaphore(slots)
+
+    SEARCH_QUEUE_WAIT = SEARCH_TIMEOUT + 240
+    SEARCH_ETA_TEXT = f"Search will take up to {SEARCH_TIMEOUT} seconds"
+    SEARCH_STILL_TEXT = (
+        f"🔄 Still searching more sources... the final list will be provided within {SEARCH_TIMEOUT} seconds."
+    )
+    return True
+
+
+def runtime_settings_loop():
+    while True:
+        try:
+            apply_runtime_settings()
+        except Exception as error:
+            print(f"[RUNTIME SETTINGS] {error}")
+        time.sleep(RUNTIME_REFRESH_SECONDS)
+
+
+threading.Thread(target=runtime_settings_loop, daemon=True, name="runtime-settings").start()
+
+
+def _save_runtime_override(name, stored):
+    ok = _api_setting_set(RUNTIME_PREFIX + name, stored)
+    if ok and name == "SPLIT_PDF":
+        # /split and the converter already read split_size_pdf on every call.
+        ok = _api_setting_set("split_size_pdf", stored) and ok
+    return ok
+
+
+def _delete_runtime_override(name):
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM bot_settings WHERE setting_key = %s",
+                (RUNTIME_PREFIX + name,),
+            )
+            if name == "SPLIT_PDF":
+                cur.execute(
+                    "DELETE FROM bot_settings WHERE setting_key = %s",
+                    ("split_size_pdf",),
+                )
+        conn.commit()
+        return True
+    except Exception as error:
+        conn.rollback()
+        print(f"[RUNTIME SETTINGS] delete {name}: {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def _delete_all_runtime_overrides():
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM bot_settings WHERE setting_key LIKE %s",
+                (RUNTIME_PREFIX + "%",),
+            )
+            cur.execute("DELETE FROM bot_settings WHERE setting_key = %s", ("split_size_pdf",))
+        conn.commit()
+        return True
+    except Exception as error:
+        conn.rollback()
+        print(f"[RUNTIME SETTINGS] reset all: {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def _runtime_settings_listing():
+    lines = ["Live settings. /set NAME VALUE changes one. /reset NAME restores its default.", ""]
+    overrides = _load_runtime_overrides() or {}
+    for name in RUNTIME_SPECS:
+        current = _format_runtime_current(name)
+        default = str(RUNTIME_DEFAULTS[name])
+        mark = " (changed)" if name in overrides else ""
+        lines.append(f"{name} = {current}    default {default}{mark}")
+    lines.append("")
+    lines.append("Aliases: ADMINS = ADMIN_USER_ID, apihelper.CONNECT_TIMEOUT = CONNECT_TIMEOUT, apihelper.READ_TIMEOUT = READ_TIMEOUT.")
+    lines.append("Every worker re-reads these from the database every 30 seconds.")
+    return "\n".join(lines)
 
 
 SEARCH_DNS_MARKERS = ("DNSError", "Cloudflare 1000", "NameResolutionError", "Name or service not known", "getaddrinfo")
@@ -6052,6 +6400,146 @@ if SERVER_ID == "s4":
         return (
             f"🧪 Test searches are ON: every search keeps running for up to {seconds}s, while users still get their "
             f"lists on the normal schedule (final list at {SEARCH_TIMEOUT}s). Switches itself off in {_format_age(left)}."
+        )
+
+    def _runtime_confirm_reply(message):
+        user_id = message.from_user.id
+        chat_id = message.chat.id
+        user_responded(user_id)
+        _complete_timed_reply(chat_id, user_id)
+        state = pending_runtime_confirm.pop(user_id, None)
+        text = (message.text or "").strip()
+        if text.startswith("/"):
+            _dispatch_command(message)
+            return
+        if not state:
+            send_temp_message(chat_id, "That confirmation has expired. Send /set again.", user_id)
+            return
+        answer = text.lower()
+        if answer not in ("yes", "y", "no", "n"):
+            pending_runtime_confirm[user_id] = state
+            send_temp_message(chat_id, "Reply yes or no.", user_id)
+            register_timed_next_step(chat_id, user_id, _runtime_confirm_reply, "set")
+            return
+        if answer in ("no", "n"):
+            send_temp_message(chat_id, "Cancelled. Nothing was changed.", user_id)
+            return
+        if state["action"] == "reset_all":
+            if not _delete_all_runtime_overrides():
+                send_temp_message(chat_id, "Database error. Nothing was reset.", user_id)
+                return
+            apply_runtime_settings()
+            send_temp_message(
+                chat_id,
+                "All /set overrides were cleared. Every worker returns to the built-in defaults within 30 seconds. This server already has the defaults.",
+                user_id,
+            )
+            return
+        if state["action"] == "reset":
+            if not _delete_runtime_override(state["key"]):
+                send_temp_message(chat_id, "Database error. Nothing was reset.", user_id)
+                return
+            apply_runtime_settings()
+            send_temp_message(
+                chat_id,
+                f"{state['key']} is back to the built-in default ({_format_runtime_current(state['key'])}). Other workers follow within 30 seconds.",
+                user_id,
+            )
+            return
+        if not _save_runtime_override(state["key"], state["stored"]):
+            send_temp_message(chat_id, "Database error. The setting was not changed.", user_id)
+            return
+        apply_runtime_settings()
+        send_temp_message(
+            chat_id,
+            f"{state['key']} is now {_format_runtime_current(state['key'])}. Other workers follow within 30 seconds.",
+            user_id,
+        )
+
+    def _ask_runtime_confirm(message, prompt, state):
+        pending_runtime_confirm[message.from_user.id] = state
+        send_prompt(message.chat.id, prompt, message.from_user.id)
+        register_timed_next_step(
+            message.chat.id, message.from_user.id, _runtime_confirm_reply, "set",
+        )
+
+    @bot.message_handler(commands=["set"])
+    def set_runtime(message):
+        if message.from_user.id not in ADMIN_USER_ID:
+            safe_send_message(message.chat.id, "❌ Access Denied.")
+            return
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) == 1:
+            send_temp_long_message(message.chat.id, _runtime_settings_listing(), message.from_user.id)
+            return
+        name = _canon_runtime_key(parts[1])
+        if name not in RUNTIME_SPECS:
+            send_temp_message(
+                message.chat.id,
+                f"Unknown setting {parts[1]}. Send /set alone to see every name.",
+                message.from_user.id,
+            )
+            return
+        if len(parts) < 3:
+            send_temp_message(
+                message.chat.id,
+                f"{name} is {_format_runtime_current(name)} (built-in default {RUNTIME_DEFAULTS[name]}).\n"
+                f"Usage: /set {name} VALUE",
+                message.from_user.id,
+            )
+            return
+        stored, error = _parse_runtime_value(name, parts[2])
+        if error:
+            send_temp_message(message.chat.id, error, message.from_user.id)
+            return
+        current = _format_runtime_current(name)
+        if stored == current:
+            send_temp_message(message.chat.id, f"{name} is already {current}.", message.from_user.id)
+            return
+        _ask_runtime_confirm(
+            message,
+            f"Change {name} from {current} to {stored}?\n\nReply yes or no. This request ends in 10 minutes.",
+            {"action": "set", "key": name, "stored": stored},
+        )
+
+    @bot.message_handler(commands=["reset"])
+    def reset_runtime(message):
+        if message.from_user.id not in ADMIN_USER_ID:
+            safe_send_message(message.chat.id, "❌ Access Denied.")
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            send_temp_message(
+                message.chat.id,
+                "Usage:\n/reset NAME\n/reset all\n\nSend /set to see every name.",
+                message.from_user.id,
+            )
+            return
+        target = parts[1].strip()
+        if target.lower() == "all":
+            _ask_runtime_confirm(
+                message,
+                "Clear every /set change and return all of those settings to the built-in defaults?\n\nReply yes or no. This request ends in 10 minutes.",
+                {"action": "reset_all"},
+            )
+            return
+        name = _canon_runtime_key(target)
+        if name not in RUNTIME_SPECS:
+            send_temp_message(
+                message.chat.id,
+                f"Unknown setting {target}. Send /set alone to see every name.",
+                message.from_user.id,
+            )
+            return
+        current = _format_runtime_current(name)
+        default = str(RUNTIME_DEFAULTS[name])
+        if current == default:
+            send_temp_message(message.chat.id, f"{name} is already the built-in default ({default}).", message.from_user.id)
+            return
+        _ask_runtime_confirm(
+            message,
+            f"Reset {name} from {current} back to the built-in default {default}?\n\nReply yes or no. This request ends in 10 minutes.",
+            {"action": "reset", "key": name},
         )
 
     @bot.message_handler(commands=['testsearches'])
